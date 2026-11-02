@@ -50,7 +50,7 @@ deps: ## Fetch missing dependencies at their pinned revisions (and the Eglantine
 	$(PYTHON) tools/deps.py fetch
 	bash tools/apply-eglantine-patches.sh
 
-update: ## Move the Eglantine submodule to the newest commit of its default branch and check the port still applies
+update: ## Move the Eglantine submodule to the newest commit of its ps5 branch and check the port still applies
 	bash tools/update-eglantine.sh
 
 deps-status: ## Show every dependency, where it lives and whether it matches its pin

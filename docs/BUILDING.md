@@ -43,7 +43,7 @@ already exists: the dependencies, this checkout's build cache in
 | `make dev DEV_TITLE=<title ID>` | Development build, `build/dev/PPSA98515` (or `EDEN_DEV_PACKAGE_DIR`): profiling counters, `dev-settings.txt` switches, boots the given title |
 | `make test` | Host (Linux) build of the emulator and its test suites |
 | `make deps` | Fetch missing dependencies at their pinned revisions |
-| `make update` | Move the Eglantine submodule to the newest commit of its default branch, list what came in, and check that the port's text anchors still match (`tools/prepare-vulkan-port.py --report`) |
+| `make update` | Move the Eglantine submodule to the newest commit of its `ps5` branch, list what came in, and check that the port's text anchors still match (`tools/prepare-vulkan-port.py --report`) |
 | `make deps-status` | List the dependencies, where they live and whether they match their pins |
 | `make prepare` | Everything besides Eden itself: build cache, FFmpeg, packaging tool, driver stub, RADV |
 | `make toolchain` | Check the host tools |
@@ -84,8 +84,8 @@ Inside this repository, in `.deps/`:
   clone. The build copies it into its cache (`tools/sync-eden-source.sh`) and uses Eden's own
   hash-pinned packages, which its configure step downloads. The PS5 frontend in `headless/` replaces
   and derives sources at configure time (`headless/inject.cmake`). The submodule
-  references Zortos's core directly; no core backport patch or Bananza terrain-counter
-  workaround is needed. The PS5 memory, loader, JIT and GPU worker adaptations stay
+  follows the `ps5` branch of exploitizm/Eglantine: Zortos's core plus the port's own core
+  changes, kept there as commits. The PS5 memory, loader, JIT and GPU worker adaptations stay
   in the port's generated-source rules.
   `tools/apply-eglantine-patches.sh` remains available for optional local patches in
   `tools/eglantine-patches/`; it is a no-op when there are none. To move to a newer

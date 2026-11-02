@@ -1,3 +1,4 @@
 [submodule "Eglantine"]
 	path = Eglantine
-	url = https://github.com/zortos293/Eglantine
+	url = https://github.com/exploitizm/Eglantine
+	branch = ps5

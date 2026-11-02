@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
-# make update: moves the Eglantine submodule to the newest commit of its default branch, lists what
+# make update: moves the Eglantine submodule to the newest commit of its ps5 branch, lists what
 # came in, and checks that the text anchors of the port (tools/prepare-vulkan-port.py) still match.
 # It stages the submodule's new commit and nothing else; commit that yourself once `make test`
 # passes.
