@@ -1086,6 +1086,10 @@ adapt('src/video_core/texture_cache/texture_cache.h',
     # targets and for images read at a new size alike: Ocarina draws 1504x1491 and reads 1491x1491 at
     # the same address the next moment, and the read copy, uploaded from guest memory, holds nothing
     # the GPU drew either (23:36: 2,052 render targets skipped, the reads still 541-651 per 600 frames).
+    # The GPU-drawn image must start at the same address and have the same format: the same target
+    # at another size. Any GPU-drawn overlap was too wide: GPU-drawn images are not tracked, so CPU
+    # writes into memory a render target had used (a texture loaded there) did not mark them, and
+    # the new texture would not be uploaded.
     ('    } clearing_scope{clearing_render_targets};\n    clearing_render_targets = is_clear;\n',
      '    } clearing_scope{clearing_render_targets};\n    clearing_render_targets = is_clear;\n'
      '    eden_preparing_render_targets = true;\n'
@@ -1093,7 +1097,9 @@ adapt('src/video_core/texture_cache/texture_cache.h',
     ('    } else {\n        // TODO: Only upload what we need\n        RefreshContents(new_image, new_image_id);\n    }\n',
      '    } else if (!join_bad_overlap_ids.empty() &&\n'
      '               std::ranges::any_of(join_bad_overlap_ids, [&](ImageId id) {\n'
-     '                   return True(slot_images[id].flags & ImageFlagBits::GpuModified);\n'
+     '                   const ImageBase& overlap = slot_images[id];\n'
+     '                   return True(overlap.flags & ImageFlagBits::GpuModified) &&\n'
+     '                          overlap.gpu_addr == new_image.gpu_addr && overlap.info.format == new_info.format;\n'
      '               }) &&\n'
      '               std::ranges::none_of(join_bad_overlap_ids, [&](ImageId id) {\n'
      '                   return True(slot_images[id].flags & ImageFlagBits::CpuModified);\n'
