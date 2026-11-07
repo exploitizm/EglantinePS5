@@ -500,8 +500,24 @@ constexpr std::size_t ColdMaxBytes = SparseSlot / 2;
 constexpr std::size_t ColdMaxBytesNoFile = SparseSlot * 3 / 4;
 // The page file: the guest's slots at their own offsets (slot x 2 MiB), only the written ones taking
 // room. Made when the service starts, gone when its range is given back.
-constexpr const char* PageFilePath = "/data/eglantineps5/cache/guest-pages.bin";
-int page_fd = -1;
+constexpr const char* PageFilePath = "/data/eglantineps5/cache/guest-pages-%02u.bin";
+int page_fd = -1; // the first page file (>= 0: paging is on)
+// The page file is PageFiles files, place p in file p % PageFiles at (p / PageFiles) x 2 MiB: one file's
+// write holds it locked, and a restore reading another slot of the same file waited for it. On an idle
+// console a 2 MiB write takes 14 ms and a read 0.5 to 1.4 ms (EDEN_PAGE_IO, 11-07 21:10); in gameplay,
+// one file written all the time, both took about 140 ms.
+constexpr std::size_t PageFiles = 16;
+int page_fds[PageFiles] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+int PageFd(std::size_t place) noexcept {
+    return page_fds[place % PageFiles];
+}
+off_t PageOffset(std::size_t place, std::size_t done) noexcept {
+    return static_cast<off_t>((place / PageFiles) * SparseSlot + done);
+}
+// At most this many slots are written to the page files a tick (32 MiB in 5 s), so paging never fills
+// the storage's queue while the game loads from it.
+constexpr unsigned PagesPerTick = 16;
+unsigned pages_this_tick = 0;
 // A slot that does not compress to half is Paged only while the pool is short (its largest free
 // block under PageShortBytes) or once no access touched it for PageAfterTicks (30 s); until then it
 // stays in Watch. Paged after 10 s, Ocarina read back 492 of 857 paged slots and its gameplay ran at
@@ -653,8 +669,8 @@ bool RestorePaged(SparseRange& range, std::size_t slot) noexcept {
     const std::size_t place = static_cast<std::size_t>(cold_slots[slot].place);
     std::size_t done = 0;
     while (done < SparseSlot) {
-        const ssize_t got = pread(page_fd, static_cast<std::uint8_t*>(view) + done, SparseSlot - done,
-                                  static_cast<off_t>(place * SparseSlot + done));
+        const ssize_t got = pread(PageFd(place), static_cast<std::uint8_t*>(view) + done, SparseSlot - done,
+                                  PageOffset(place, done));
         if (got <= 0) {
             if (got < 0 && errno == EINTR) continue;
             Note("EDEN_CRAM a paged slot of the guest's memory could not be read back from the page file\n");
@@ -1109,8 +1125,9 @@ bool CoolSlot(SparseRange& range, std::size_t slot, std::uint32_t idle) noexcept
         UnlockSlot(range, slot, SlotState(range, slot));
         return false;
     }
-    const bool may_page = page_fd >= 0 && (idle >= PageAfterTicks ||
-                                           (idle >= PageAfterTicksShort && pool_short.load(std::memory_order_relaxed)));
+    const bool may_page = page_fd >= 0 && pages_this_tick < PagesPerTick &&
+                          (idle >= PageAfterTicks ||
+                           (idle >= PageAfterTicksShort && pool_short.load(std::memory_order_relaxed)));
     const std::int64_t physical = range.physical[slot];
     void* view = reinterpret_cast<void*>(cpu_mapping_hint);
     bool cooled = false;
@@ -1134,8 +1151,8 @@ bool CoolSlot(SparseRange& range, std::size_t slot, std::uint32_t idle) noexcept
             const std::uint64_t write_began = NowNs();
             std::size_t done = 0;
             while (done < SparseSlot) {
-                const ssize_t put = pwrite(page_fd, static_cast<const std::uint8_t*>(view) + done, SparseSlot - done,
-                                           static_cast<off_t>(std::size_t(place) * SparseSlot + done));
+                const ssize_t put = pwrite(PageFd(std::size_t(place)), static_cast<const std::uint8_t*>(view) + done,
+                                           SparseSlot - done, PageOffset(std::size_t(place), done));
                 if (put <= 0) {
                     if (put < 0 && errno == EINTR) continue;
                     break;
@@ -1143,6 +1160,7 @@ bool CoolSlot(SparseRange& range, std::size_t slot, std::uint32_t idle) noexcept
                 done += static_cast<std::size_t>(put);
             }
             written = done == SparseSlot;
+            ++pages_this_tick;
             if (written) cold_slots[slot].place = place;
             else {
                 counters.page_failures.fetch_add(1, std::memory_order_relaxed);
@@ -1200,6 +1218,7 @@ void ColdTick(SparseRange& range) noexcept {
     NoteMax(counters.tick_max_ns, took);
 }
 void ColdTickBody(SparseRange& range) noexcept {
+    pages_this_tick = 0;
     const std::uint32_t tick = cold_tick.fetch_add(1, std::memory_order_relaxed) + 1;
     {
         const std::int64_t total = sceKernelGetDirectMemorySize();
@@ -1692,12 +1711,25 @@ void ServiceStart(SparseRange& range) noexcept {
     cold_tick.store(0, std::memory_order_relaxed);
 #ifdef PS5_NATIVE
     if (page_fd < 0) {
-        page_fd = open(PageFilePath, O_RDWR | O_CREAT | O_TRUNC, 0666);
-        if (page_fd < 0) Note("EDEN_CRAM no page file: slots that do not compress stay in memory\n");
+        bool opened = true;
+        for (std::size_t file = 0; file < PageFiles && opened; ++file) {
+            char path[96];
+            std::snprintf(path, sizeof(path), PageFilePath, unsigned(file));
+            page_fds[file] = open(path, O_RDWR | O_CREAT | O_TRUNC, 0666);
+            opened = page_fds[file] >= 0;
+        }
+        if (opened) {
+            page_fd = page_fds[0];
+        } else {
+            for (int& fd : page_fds)
+                if (fd >= 0) (void)close(fd), fd = -1;
+            Note("EDEN_CRAM no page file: slots that do not compress stay in memory\n");
+        }
     }
     page_place_used = new (std::nothrow) std::atomic<std::uint8_t>[cold_slot_count]();
     if (page_place_used == nullptr && page_fd >= 0) {
-        (void)close(page_fd);
+        for (int& fd : page_fds)
+            if (fd >= 0) (void)close(fd), fd = -1;
         page_fd = -1;
     }
 #endif
@@ -1778,9 +1810,14 @@ void ReleaseServiceBlocks(SparseRange& range) noexcept {
         counters.cold_bytes.store(0, std::memory_order_relaxed);
     }
     if (page_fd >= 0) {
-        (void)close(page_fd);
+        for (std::size_t file = 0; file < PageFiles; ++file) {
+            (void)close(page_fds[file]);
+            page_fds[file] = -1;
+            char path[96];
+            std::snprintf(path, sizeof(path), PageFilePath, unsigned(file));
+            (void)unlink(path);
+        }
         page_fd = -1;
-        (void)unlink(PageFilePath);
     }
     delete[] page_place_used;
     page_place_used = nullptr;
