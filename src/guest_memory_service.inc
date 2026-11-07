@@ -69,7 +69,7 @@ struct Counters {
     // writes, and the longest restore a fault waited for.
     std::atomic<std::uint64_t> tick_ns{0}, tick_max_ns{0}, compress_ns{0}, write_ns{0}, write_max_ns{0};
     std::atomic<std::uint64_t> restore_max_ns{0}, restore_ns{0}, restores{0}, read_ns{0}, read_max_ns{0};
-    std::atomic<std::uint64_t> restore_pool_hits{0};
+    std::atomic<std::uint64_t> restore_pool_hits{0}, compresses{0}, compress_skips{0};
 };
 std::uint64_t NowNs() noexcept {
     timespec ts{};
@@ -518,6 +518,12 @@ off_t PageOffset(std::size_t place, std::size_t done) noexcept {
 // the storage's queue while the game loads from it.
 constexpr unsigned PagesPerTick = 16;
 unsigned pages_this_tick = 0;
+// At most this many slots are compressed a tick (about 5 ms each). Slots over it wait for the next
+// tick; they only get older. At 21:23 the scanner spent 1.3 s a tick compressing, most of it on
+// slots compressed again every tick because they did not compress to half and were not yet old
+// enough to page: a slot in Watch is not touched (a touch ends Watch), so one result holds.
+constexpr unsigned CompressPerTick = 96;
+unsigned compresses_this_tick = 0;
 // A slot that does not compress to half is Paged only while the pool is short (its largest free
 // block under PageShortBytes) or once no access touched it for PageAfterTicks (30 s); until then it
 // stays in Watch. Paged after 10 s, Ocarina read back 492 of 857 paged slots and its gameplay ran at
@@ -549,6 +555,7 @@ struct ColdSlot {
     std::uint32_t next = 0;                                     // the first tick it may go into Watch again
     std::uint8_t times = 0;                                     // backoffs so far
     std::int32_t place = -1;                                    // a Paged slot's place in the page file
+    bool too_big = false;                                       // in this Watch, did not compress to half
 };
 ColdSlot* cold_slots = nullptr;
 std::size_t cold_slot_count = 0;
@@ -1112,6 +1119,7 @@ bool WatchSlot(SparseRange& range, std::size_t slot, std::uint32_t tick) noexcep
         return false;
     }
     cold_slots[slot].since = tick;
+    cold_slots[slot].too_big = false;
     UnlockSlot(range, slot, SlotWatch);
     counters.watched.fetch_add(1, std::memory_order_relaxed);
     return true;
@@ -1128,20 +1136,36 @@ bool CoolSlot(SparseRange& range, std::size_t slot, std::uint32_t idle) noexcept
     const bool may_page = page_fd >= 0 && pages_this_tick < PagesPerTick &&
                           (idle >= PageAfterTicks ||
                            (idle >= PageAfterTicksShort && pool_short.load(std::memory_order_relaxed)));
+    const bool too_big = cold_slots[slot].too_big;
+    if ((too_big && !may_page) || (!too_big && compresses_this_tick >= CompressPerTick)) {
+        // Known not to compress to half and not old enough to page, or out of this tick's
+        // compressions: it stays in Watch untouched.
+        if (too_big) counters.compress_skips.fetch_add(1, std::memory_order_relaxed);
+        UnlockSlot(range, slot, SlotWatch);
+        return false;
+    }
     const std::int64_t physical = range.physical[slot];
     void* view = reinterpret_cast<void*>(cpu_mapping_hint);
     bool cooled = false;
     if (sceKernelMapDirectMemory(&view, SparseSlot, PROT_READ, 0, physical, SparseSlot) == 0) {
         // The scanner's own room for one slot compressed (LZ4's bound for 2 MiB).
         static std::vector<std::uint8_t> room(SparseSlot + SparseSlot / 255 + 16);
-        const std::uint64_t compress_began = NowNs();
-        const std::size_t packed = guest_memory_compress.load(std::memory_order_acquire)(view, SparseSlot, room.data(),
-                                                                                         room.size());
-        counters.compress_ns.fetch_add(NowNs() - compress_began, std::memory_order_relaxed);
+        std::size_t packed = 0;
+        if (too_big) {
+            counters.compress_skips.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            ++compresses_this_tick;
+            counters.compresses.fetch_add(1, std::memory_order_relaxed);
+            const std::uint64_t compress_began = NowNs();
+            packed = guest_memory_compress.load(std::memory_order_acquire)(view, SparseSlot, room.data(), room.size());
+            counters.compress_ns.fetch_add(NowNs() - compress_began, std::memory_order_relaxed);
+        }
         // Not to half: the page file takes it whole, where there is one.
         bool written = false;
         if ((packed == 0 || packed > ColdMaxBytes) && page_fd >= 0 && !may_page) {
-            // Not to half, and not to be paged yet: it stays in Watch, its block kept.
+            // Not to half, and not to be paged yet: it stays in Watch, its block kept, and is not
+            // compressed again while it stays there.
+            cold_slots[slot].too_big = true;
             if (munmap(view, SparseSlot) != 0) std::abort();
             UnlockSlot(range, slot, SlotWatch);
             return false;
@@ -1219,6 +1243,7 @@ void ColdTick(SparseRange& range) noexcept {
 }
 void ColdTickBody(SparseRange& range) noexcept {
     pages_this_tick = 0;
+    compresses_this_tick = 0;
     const std::uint32_t tick = cold_tick.fetch_add(1, std::memory_order_relaxed) + 1;
     {
         const std::int64_t total = sceKernelGetDirectMemorySize();
@@ -1472,13 +1497,15 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
         const int time_length = std::snprintf(cold_line, sizeof(cold_line),
             "EDEN_CRAM_TIME %s ticks=%u tick_ms=%llu tick_max_ms=%llu compress_ms=%llu write_ms=%llu write_max_ms=%llu "
             "restores=%llu restore_avg_us=%llu restore_max_ms=%llu read_ms=%llu read_max_ms=%llu kept_blocks=%zu "
-            "kept_hits=%llu\n",
+            "kept_hits=%llu compresses=%llu compress_skips=%llu\n",
             when, cold_tick.load(std::memory_order_relaxed), ms(counters.tick_ns), ms(counters.tick_max_ns),
             ms(counters.compress_ns), ms(counters.write_ns), ms(counters.write_max_ns), restores,
             restores ? (unsigned long long)(counters.restore_ns.load() / 1000 / restores) : 0ull,
             ms(counters.restore_max_ns), ms(counters.read_ns), ms(counters.read_max_ns),
             restore_pool_count.load(std::memory_order_relaxed),
-            (unsigned long long)counters.restore_pool_hits.load(std::memory_order_relaxed));
+            (unsigned long long)counters.restore_pool_hits.load(std::memory_order_relaxed),
+            (unsigned long long)counters.compresses.load(std::memory_order_relaxed),
+            (unsigned long long)counters.compress_skips.load(std::memory_order_relaxed));
         if (time_length > 0) Report(cold_line);
     }
 #ifdef PS5_NATIVE
