@@ -1074,7 +1074,43 @@ for signature, index in (
     texture_costs.append((anchor, anchor + scope))
 adapt('src/video_core/texture_cache/texture_cache.h',
       'vulkan-cache/video_core/texture_cache/texture_cache.h', [
-    ('namespace VideoCommon {', '#include "performance.h"\n#include "staging_chunks.h"\n#include "common/scope_exit.h"\nnamespace Vulkan { class TextureCacheRuntime; }\n\nnamespace VideoCommon {'),
+    ('namespace VideoCommon {', '#include "performance.h"\n#include "staging_chunks.h"\n#include "common/scope_exit.h"\nnamespace Vulkan { class TextureCacheRuntime; }\n\nnamespace VideoCommon {\n'
+     '// True while UpdateRenderTargets looks up the render targets (JoinImages: stale guest memory).\n'
+     'inline thread_local bool eden_preparing_render_targets = false;'),
+    # A render target made again at a new size, over images the GPU drew into, is not uploaded from
+    # guest memory: the GPU's drawing never reached guest memory, so what is there is stale. Ocarina
+    # of Time resizes a few render targets nearly every frame (95, 96, 97, 112x97 ... up to 1736
+    # pixels square at 0x814de35000) and each new size was uploaded, 0.5 to 5 GiB per 600 frames
+    # (2026-11-07 23:20). Only when an image it overlaps that did not fit was drawn by the GPU and none
+    # has CPU writes pending; the image is tracked so a later CPU write still uploads. For render
+    # targets and for images read at a new size alike: Ocarina draws 1504x1491 and reads 1491x1491 at
+    # the same address the next moment, and the read copy, uploaded from guest memory, holds nothing
+    # the GPU drew either (23:36: 2,052 render targets skipped, the reads still 541-651 per 600 frames).
+    ('    } clearing_scope{clearing_render_targets};\n    clearing_render_targets = is_clear;\n',
+     '    } clearing_scope{clearing_render_targets};\n    clearing_render_targets = is_clear;\n'
+     '    eden_preparing_render_targets = true;\n'
+     '    SCOPE_EXIT { eden_preparing_render_targets = false; };\n'),
+    ('    } else {\n        // TODO: Only upload what we need\n        RefreshContents(new_image, new_image_id);\n    }\n',
+     '    } else if (!join_bad_overlap_ids.empty() &&\n'
+     '               std::ranges::any_of(join_bad_overlap_ids, [&](ImageId id) {\n'
+     '                   return True(slot_images[id].flags & ImageFlagBits::GpuModified);\n'
+     '               }) &&\n'
+     '               std::ranges::none_of(join_bad_overlap_ids, [&](ImageId id) {\n'
+     '                   return True(slot_images[id].flags & ImageFlagBits::CpuModified);\n'
+     '               })) {\n'
+     '        static u64 eden_stale_skips = 0;\n'
+     '        if (eden_stale_skips++ % 1024 < 4) {\n'
+     '            LOG_INFO(HW_GPU, "EDEN_TC_STALE {} {:#x} {}x{} format {}: not uploaded over {} images, one GPU-drawn ({} so far)",\n'
+     '                     eden_preparing_render_targets ? "render target" : "read", new_image.gpu_addr,\n'
+     '                     new_info.size.width, new_info.size.height, static_cast<u32>(new_info.format),\n'
+     '                     join_bad_overlap_ids.size(), eden_stale_skips);\n'
+     '        }\n'
+     '        new_image.flags &= ~ImageFlagBits::CpuModified;\n'
+     '        if (False(new_image.flags & ImageFlagBits::Tracked)) {\n'
+     '            TrackImage(new_image, new_image_id);\n'
+     '        }\n'
+     '        runtime.TransitionImageLayout(new_image);\n'
+     '    } else {\n        // TODO: Only upload what we need\n        RefreshContents(new_image, new_image_id);\n    }\n'),
     (download_prefix, download_prefix + (port / 'vulkan_download_batch.inc').read_text() + '\n'),
     # Uploads UploadInChunks leaves whole (images converted on the CPU, 3D, sparse and unbacked
     # ones) are laid out in the heap and staged in pieces of at most 64 MiB once over 64 MiB
