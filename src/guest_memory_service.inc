@@ -517,6 +517,8 @@ off_t PageOffset(std::size_t place, std::size_t done) noexcept {
 // At most this many slots are written to the page files a tick (32 MiB in 5 s), so paging never fills
 // the storage's queue while the game loads from it.
 constexpr unsigned PagesPerTick = 16;
+// While the pool is short: 64 slots a tick (128 MiB in 5 s, a write takes about 9 ms).
+constexpr unsigned PagesPerTickShort = 64;
 unsigned pages_this_tick = 0;
 // At most this many slots are compressed a tick (about 5 ms each). Slots over it wait for the next
 // tick; they only get older. At 21:23 the scanner spent 1.3 s a tick compressing, most of it on
@@ -529,10 +531,12 @@ unsigned compresses_this_tick = 0;
 // stays in Watch. Paged after 10 s, Ocarina read back 492 of 857 paged slots and its gameplay ran at
 // 4 to 15 frames a second (19:21).
 // 30 s (and at once while short) paged too eagerly: in gameplay the pool is short all the time, and
-// half of what was paged was read back, each read a stall (20:41: 626 of 1,243). Now 2 minutes
-// untouched, 1 minute while the pool is short.
-constexpr std::uint32_t PageAfterTicks = 24;
-constexpr std::uint32_t PageAfterTicksShort = 12;
+// half of what was paged was read back, each read a stall (20:41: 626 of 1,243). Then 2 minutes
+// untouched, 1 minute while the pool is short. With 16 page files a read back takes about 1 ms, not
+// 137 (21:23), and waiting a minute left the gameplay load with nothing paged: the guest grew from 4
+// to 5 GiB in 10 s and the pool ran out (22:08, 22:19). Now 30 s untouched, 15 s while short.
+constexpr std::uint32_t PageAfterTicks = 6;
+constexpr std::uint32_t PageAfterTicksShort = 3;
 constexpr std::size_t PageShortBytes = std::size_t{1} << 30;
 // Places in the page file: a paged slot takes the lowest free one and gives it back when read back
 // or given back, so the file stays compact and most writes go over room the file already has. At
@@ -1133,9 +1137,9 @@ bool CoolSlot(SparseRange& range, std::size_t slot, std::uint32_t idle) noexcept
         UnlockSlot(range, slot, SlotState(range, slot));
         return false;
     }
-    const bool may_page = page_fd >= 0 && pages_this_tick < PagesPerTick &&
-                          (idle >= PageAfterTicks ||
-                           (idle >= PageAfterTicksShort && pool_short.load(std::memory_order_relaxed)));
+    const bool short_now = pool_short.load(std::memory_order_relaxed);
+    const bool may_page = page_fd >= 0 && pages_this_tick < (short_now ? PagesPerTickShort : PagesPerTick) &&
+                          (idle >= PageAfterTicks || (idle >= PageAfterTicksShort && short_now));
     const bool too_big = cold_slots[slot].too_big;
     if ((too_big && !may_page) || (!too_big && compresses_this_tick >= CompressPerTick)) {
         // Known not to compress to half and not old enough to page, or out of this tick's
