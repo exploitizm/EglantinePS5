@@ -1145,22 +1145,35 @@ if(PS5_NATIVE)
     # A segment is decoded where it belongs (read there directly when it is not compressed), and
     # a segment that does not decode ends the load instead of the app.
     set(old_nso_segment [=[            if (nso_header.IsSegmentCompressed(i)) {
+                const u32 segment_size = nso_header.segments[i].size;
                 if (nso_header.IsZBICCompressed()) {
                     // ZBIC compression
                     const int r = Common::Compression::DecompressDataZBIC(
-                        std::span<u8>{decompressed_size}.first(nso_header.segments[i].size),
+                        std::span<u8>{decompressed_size}.first(segment_size),
                         std::span<const u8>{compressed_data}.first(nso_header.segments_compressed_size[i])
                     );
-                    ASSERT(r > 0);
+                    // A failed segment would leave the previous segment's bytes in the buffer and
+                    // boot a corrupt image that hangs without presenting; refuse to load instead.
+                    if (r <= 0) {
+                        LOG_ERROR(Loader, "{}: segment {} failed ZBIC decompression",
+                                  nso_file.GetName(), i);
+                        return std::nullopt;
+                    }
+                    if (static_cast<u32>(r) != segment_size) {
+                        LOG_WARNING(Loader, "{}: segment {} decompressed to {:#x} of {:#x} bytes",
+                                    nso_file.GetName(), i, r, segment_size);
+                        std::fill(decompressed_size.begin() + r,
+                                  decompressed_size.begin() + segment_size, u8{0});
+                    }
                 } else {
                     // LZ4 compression
                     int r = Common::Compression::DecompressDataLZ4(
                         decompressed_size.data(),
-                        nso_header.segments[i].size,
+                        segment_size,
                         compressed_data.data(),
                         nso_header.segments_compressed_size[i]
                     );
-                    ASSERT(r == int(nso_header.segments[i].size));
+                    ASSERT(r == int(segment_size));
                 }
 
                 std::memcpy(
@@ -1187,6 +1200,9 @@ if(PS5_NATIVE)
                         std::span<u8>{destination, nso_header.segments[i].size},
                         std::span<const u8>{compressed_data}.first(nso_header.segments_compressed_size[i]));
                     if (r <= 0) return std::nullopt;
+                    // A short segment is zero-filled past its end (Lichii #160).
+                    if (static_cast<u32>(r) < nso_header.segments[i].size)
+                        std::fill(destination + r, destination + nso_header.segments[i].size, u8{0});
                 } else {
                     const int r = Common::Compression::DecompressDataLZ4(destination, nso_header.segments[i].size,
                         compressed_data.data(), nso_header.segments_compressed_size[i]);
