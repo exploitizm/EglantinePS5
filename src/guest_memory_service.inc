@@ -69,7 +69,7 @@ struct Counters {
     // writes, and the longest restore a fault waited for.
     std::atomic<std::uint64_t> tick_ns{0}, tick_max_ns{0}, compress_ns{0}, write_ns{0}, write_max_ns{0};
     std::atomic<std::uint64_t> restore_max_ns{0}, restore_ns{0}, restores{0}, read_ns{0}, read_max_ns{0};
-    std::atomic<std::uint64_t> restore_pool_hits{0}, compresses{0}, compress_skips{0};
+    std::atomic<std::uint64_t> restore_pool_hits{0}, compresses{0}, compress_skips{0}, page_pauses{0};
 };
 std::uint64_t NowNs() noexcept {
     timespec ts{};
@@ -519,6 +519,11 @@ off_t PageOffset(std::size_t place, std::size_t done) noexcept {
 constexpr unsigned PagesPerTick = 16;
 // While the pool is short: 64 slots a tick (128 MiB in 5 s, a write takes about 9 ms).
 constexpr unsigned PagesPerTickShort = 64;
+// A write slower than this means the storage is busy (with the game's own loading, or with this
+// paging): no more slots are written this tick or the next. At 22:50, 64 a tick while short made
+// writes take up to 938 ms and restores 5.7 ms on average, and the game nearly froze for 40 s.
+constexpr std::uint64_t PageSlowWriteNs = 50'000'000;
+std::uint32_t page_resume_tick = 0;
 unsigned pages_this_tick = 0;
 // At most this many slots are compressed a tick (about 5 ms each). Slots over it wait for the next
 // tick; they only get older. At 21:23 the scanner spent 1.3 s a tick compressing, most of it on
@@ -1139,6 +1144,7 @@ bool CoolSlot(SparseRange& range, std::size_t slot, std::uint32_t idle) noexcept
     }
     const bool short_now = pool_short.load(std::memory_order_relaxed);
     const bool may_page = page_fd >= 0 && pages_this_tick < (short_now ? PagesPerTickShort : PagesPerTick) &&
+                          cold_tick.load(std::memory_order_relaxed) >= page_resume_tick &&
                           (idle >= PageAfterTicks || (idle >= PageAfterTicksShort && short_now));
     const bool too_big = cold_slots[slot].too_big;
     if ((too_big && !may_page) || (!too_big && compresses_this_tick >= CompressPerTick)) {
@@ -1196,6 +1202,10 @@ bool CoolSlot(SparseRange& range, std::size_t slot, std::uint32_t idle) noexcept
             }
             const std::uint64_t write_took = NowNs() - write_began;
             counters.write_ns.fetch_add(write_took, std::memory_order_relaxed);
+            if (write_took > PageSlowWriteNs) {
+                page_resume_tick = cold_tick.load(std::memory_order_relaxed) + 2;
+                counters.page_pauses.fetch_add(1, std::memory_order_relaxed);
+            }
             NoteMax(counters.write_max_ns, write_took);
         }
         if (munmap(view, SparseSlot) != 0) std::abort();
@@ -1501,7 +1511,7 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
         const int time_length = std::snprintf(cold_line, sizeof(cold_line),
             "EDEN_CRAM_TIME %s ticks=%u tick_ms=%llu tick_max_ms=%llu compress_ms=%llu write_ms=%llu write_max_ms=%llu "
             "restores=%llu restore_avg_us=%llu restore_max_ms=%llu read_ms=%llu read_max_ms=%llu kept_blocks=%zu "
-            "kept_hits=%llu compresses=%llu compress_skips=%llu\n",
+            "kept_hits=%llu compresses=%llu compress_skips=%llu page_pauses=%llu\n",
             when, cold_tick.load(std::memory_order_relaxed), ms(counters.tick_ns), ms(counters.tick_max_ns),
             ms(counters.compress_ns), ms(counters.write_ns), ms(counters.write_max_ns), restores,
             restores ? (unsigned long long)(counters.restore_ns.load() / 1000 / restores) : 0ull,
@@ -1509,7 +1519,8 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
             restore_pool_count.load(std::memory_order_relaxed),
             (unsigned long long)counters.restore_pool_hits.load(std::memory_order_relaxed),
             (unsigned long long)counters.compresses.load(std::memory_order_relaxed),
-            (unsigned long long)counters.compress_skips.load(std::memory_order_relaxed));
+            (unsigned long long)counters.compress_skips.load(std::memory_order_relaxed),
+            (unsigned long long)counters.page_pauses.load(std::memory_order_relaxed));
         if (time_length > 0) Report(cold_line);
     }
 #ifdef PS5_NATIVE
