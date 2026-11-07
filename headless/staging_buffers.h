@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <tuple>
 
 namespace Eden::StagingBuffers {
 inline constexpr std::uint64_t kExactAbove = std::uint64_t{16} << 20;
@@ -65,6 +66,33 @@ Released ReleaseFrom(Level& level, Drop&& drop) {
     entries.erase(kept, entries.end());
     if (level.delete_index >= entries.size()) level.delete_index = 0;
     if (level.iterate_index > entries.size()) level.iterate_index = 0;
+    return released;
+}
+// The most the pool keeps of buffers the GPU is done with. Eden lets them go one size level a
+// frame, 16 at a time, so after a burst (Ocarina's load into gameplay asked for about 460 MiB of
+// staging in a second, at the moment the pool ran out) they stayed for many frames. Past this,
+// the largest go each frame; while memory is short, all of them.
+inline constexpr std::uint64_t kIdleCap = std::uint64_t{64} << 20;
+
+// Keeps at most `cap` bytes of the buffers `idle` picks in `caches` (the pool's caches, each an
+// array of levels): whole levels go, largest first, until what is left is under it.
+template <class Cache, std::size_t N, class Idle>
+Released CapIdle(Cache* const (&caches)[N], Idle&& idle, std::uint64_t cap) {
+    std::uint64_t kept = 0;
+    for (Cache* const cache : caches)
+        for (const auto& level : *cache)
+            for (const auto& entry : level.entries)
+                if (idle(entry)) kept += Holds(entry.mapped_span.size(), entry.log2_level);
+    Released released;
+    if (kept <= cap) return released;
+    for (std::size_t log2 = std::tuple_size_v<Cache>; log2-- > 0 && kept > cap;) {
+        for (Cache* const cache : caches) {
+            if (kept <= cap) break;
+            const Released level = ReleaseFrom((*cache)[log2], idle);
+            kept -= std::min<std::uint64_t>(kept, level.bytes);
+            released += level;
+        }
+    }
     return released;
 }
 } // namespace Eden::StagingBuffers
