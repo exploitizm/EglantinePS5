@@ -638,8 +638,9 @@ adapt('src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp', 'vulkan_stagi
      '        staging_released_bytes.fetch_add(released.bytes, std::memory_order_relaxed);\n'
      '        return;\n'
      '    }\n'
-     '    // At most kIdleCap of idle buffers kept, none while memory is short (staging_buffers.h).\n'
-     '    {\n'
+     '    // At most kIdleCap of idle buffers kept, none while memory is short (staging_buffers.h);\n'
+     '    // not with the switch file no-staging-cap.txt.\n'
+     '    if (!::Eden::Performance::no_staging_cap.load(std::memory_order_relaxed)) {\n'
      '        const auto idle = [this](const StagingBuffer& entry) {\n'
      '            return !entry.deferred && scheduler.IsFree(entry.tick);\n'
      '        };\n'
@@ -1095,7 +1096,8 @@ adapt('src/video_core/texture_cache/texture_cache.h',
      '    eden_preparing_render_targets = true;\n'
      '    SCOPE_EXIT { eden_preparing_render_targets = false; };\n'),
     ('    } else {\n        // TODO: Only upload what we need\n        RefreshContents(new_image, new_image_id);\n    }\n',
-     '    } else if (!join_bad_overlap_ids.empty() &&\n'
+     '    } else if (!::Eden::Performance::no_stale_skip.load(std::memory_order_relaxed) &&\n'
+     '               !join_bad_overlap_ids.empty() &&\n'
      '               std::ranges::any_of(join_bad_overlap_ids, [&](ImageId id) {\n'
      '                   const ImageBase& overlap = slot_images[id];\n'
      '                   return True(overlap.flags & ImageFlagBits::GpuModified) &&\n'

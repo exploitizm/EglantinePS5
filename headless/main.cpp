@@ -120,7 +120,7 @@ extern "C" bool eden_jit_shared;  // headless/dynarmic/jit_group_support.inc
 #endif
 #include "profiles.h"
 #include "stop_limit.h"
-namespace Common { void SetGuestMemoryFine(bool on) noexcept; }
+namespace Common { void SetGuestMemoryFine(bool on) noexcept; void SetGuestMemoryCold(bool on) noexcept; }
 namespace Common {
 bool SparseTablesAvailable() noexcept; // src/memory_pages.cpp
 }
@@ -593,6 +593,18 @@ int main(int argc, char** argv) {
             [](void* to, std::size_t room, const void* source, std::size_t bytes) -> int {
                 return Common::Compression::DecompressDataLZ4(to, room, source, bytes);
             });
+        // Switch files (release builds too), to tell apart what a rendering fault comes from.
+        {
+            const bool no_cold = std::filesystem::exists(Eden::AppFile("no-cold-paging.txt"));
+            const bool no_cap = std::filesystem::exists(Eden::AppFile("no-staging-cap.txt"));
+            const bool no_skip = std::filesystem::exists(Eden::AppFile("no-stale-skip.txt"));
+            Common::SetGuestMemoryCold(!no_cold);
+            Eden::Performance::no_staging_cap = no_cap;
+            Eden::Performance::no_stale_skip = no_skip;
+            std::fprintf(stderr, "EDEN_SWITCHES cold_paging=%s staging_cap=%s stale_skip=%s\n",
+                         no_cold ? "off" : "on", no_cap ? "off" : "on", no_skip ? "off" : "on");
+            std::fflush(stderr);
+        }
 #ifdef EDEN_DEV_VULKAN
         Eden::Performance::vulkan_cost_enabled = std::filesystem::exists(Eden::AppFile("cost-run.txt"));
         const bool performance_run = std::filesystem::exists(Eden::AppFile("performance-run.txt"));

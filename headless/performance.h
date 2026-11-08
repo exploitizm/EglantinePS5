@@ -321,6 +321,12 @@ inline PoolView ViewOfPool(bool known, std::size_t largest, std::size_t held, st
 }
 // Development: the texture cache reports its memory use and marks every 300 frames.
 inline std::atomic<bool> texture_budget_log{false};
+// Switch files in the app folder (main.cpp), release builds too, to tell apart what a rendering
+// fault comes from: no-staging-cap.txt keeps Eden's own release of idle staging buffers only
+// (staging_buffers.h, CapIdle); no-stale-skip.txt uploads every image JoinImages makes, the same
+// target at a new size over a GPU-drawn one included (prepare-vulkan-port.py).
+inline std::atomic<bool> no_staging_cap{false};
+inline std::atomic<bool> no_stale_skip{false};
 // "Is memory short?", installed by the PS5 build (performance.cpp, GraphicsMemoryShort). This
 // header is compiled into libraries with and without PS5_NATIVE, so the function below must read
 // the same in all of them: the platform part is behind this pointer, not behind an #ifdef.

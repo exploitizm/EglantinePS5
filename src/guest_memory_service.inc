@@ -51,6 +51,8 @@ constexpr unsigned FineBackoffMax = 10;
 // dozen 2 MiB pairs that were written apart within a minute, and with it on a large game held 20 FPS
 // instead of 30 (the GPU worker waited for every fence, once a frame) where it held 30 without.
 std::atomic<bool> service_requested{true}, scan_requested{true}, dedup_requested{false}, fine_requested{false};
+// Watch, Cold and Paged (off: app-folder file no-cold-paging.txt, SetGuestMemoryCold).
+std::atomic<bool> cold_requested{true};
 std::atomic<SparseRange*> service_range{nullptr}; // the guest range the service runs for
 std::atomic<SparseRange*> probe_range{nullptr};   // the self-test's range
 std::atomic<int> service_state{0};                // 0 not tested, 1 works here, 2 does not
@@ -1249,6 +1251,7 @@ bool CoolSlot(SparseRange& range, std::size_t slot, std::uint32_t idle) noexcept
 void ColdTickBody(SparseRange& range) noexcept;
 void ColdTick(SparseRange& range) noexcept {
     if (cold_slots == nullptr || guest_memory_compress.load(std::memory_order_acquire) == nullptr) return;
+    if (!cold_requested.load(std::memory_order_relaxed)) return; // no slot goes into Watch
     const std::uint64_t began = NowNs();
     ColdTickBody(range);
     const std::uint64_t took = NowNs() - began;
@@ -1894,6 +1897,13 @@ void SetGuestMemoryService(bool on, bool scan, bool dedup) noexcept {
 // waits for it to be made whole (a fault and a 2 MiB copy, about 0.3 ms).
 void SetGuestMemoryFine(bool on) noexcept {
     fine_requested.store(on, std::memory_order_relaxed);
+}
+
+// App-folder file no-cold-paging.txt: no slot goes into Watch, so none is compressed (Cold) or
+// written to the page file (Paged); the rest of the service is as before. To tell apart what a
+// rendering fault comes from.
+void SetGuestMemoryCold(bool on) noexcept {
+    cold_requested.store(on, std::memory_order_relaxed);
 }
 
 // The guest's kernel hands pages out: they are committed now only without the service.
