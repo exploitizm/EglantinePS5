@@ -669,6 +669,18 @@ void DecommitVectorPage(std::uintptr_t page) noexcept {
     std::memset(reinterpret_cast<void*>(page), 0, static_cast<std::size_t>(size));
 }
 
+// Compression for the guest's Cold slots (guest_memory_service.inc), given by the app as it starts
+// (headless/main.cpp: Eden's LZ4), so this file needs none of Eden's headers. Without it no slot
+// goes Cold.
+using GuestMemoryCompress = std::size_t (*)(const void* source, std::size_t bytes, void* to, std::size_t room);
+using GuestMemoryDecompress = int (*)(void* to, std::size_t room, const void* source, std::size_t bytes);
+std::atomic<GuestMemoryCompress> guest_memory_compress{nullptr};
+std::atomic<GuestMemoryDecompress> guest_memory_decompress{nullptr};
+void SetGuestMemoryCompression(GuestMemoryCompress compress, GuestMemoryDecompress decompress) noexcept {
+    guest_memory_decompress.store(decompress, std::memory_order_release);
+    guest_memory_compress.store(compress, std::memory_order_release);
+}
+
 #include "guest_memory_service.inc"
 
 // Address space the sparse tables span, and the memory they hold (for the log).

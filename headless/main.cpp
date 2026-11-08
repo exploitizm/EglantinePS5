@@ -1,3 +1,9 @@
+#include <cstddef>
+#include "common/lz4_compression.h"
+namespace Common {
+void SetGuestMemoryCompression(std::size_t (*)(const void*, std::size_t, void*, std::size_t),
+                               int (*)(void*, std::size_t, const void*, std::size_t)) noexcept;
+}
 #ifdef EDEN_DEV_ROM_ID
 #include "development_input.h"
 #endif
@@ -114,7 +120,7 @@ extern "C" bool eden_jit_shared;  // headless/dynarmic/jit_group_support.inc
 #endif
 #include "profiles.h"
 #include "stop_limit.h"
-namespace Common { void SetGuestMemoryFine(bool on) noexcept; }
+namespace Common { void SetGuestMemoryFine(bool on) noexcept; void SetGuestMemoryCold(bool on) noexcept; }
 namespace Common {
 bool SparseTablesAvailable() noexcept; // src/memory_pages.cpp
 }
@@ -575,6 +581,30 @@ int main(int argc, char** argv) {
         launch_error.clear();
         if (!rooms.BeginGame()) throw std::runtime_error("Join a room successfully or leave it before starting a game.");
         SCOPE_EXIT { rooms.EndGame(); };
+        // The guest's Cold slots compress with Eden's LZ4 (src/guest_memory_service.inc).
+        Common::SetGuestMemoryCompression(
+            [](const void* source, std::size_t bytes, void* to, std::size_t room) -> std::size_t {
+                const auto packed =
+                    Common::Compression::CompressDataLZ4(static_cast<const u8*>(source), bytes);
+                if (packed.empty() || packed.size() > room) return 0;
+                std::memcpy(to, packed.data(), packed.size());
+                return packed.size();
+            },
+            [](void* to, std::size_t room, const void* source, std::size_t bytes) -> int {
+                return Common::Compression::DecompressDataLZ4(to, room, source, bytes);
+            });
+        // Switch files (release builds too), to tell apart what a rendering fault comes from.
+        {
+            const bool no_cold = std::filesystem::exists(Eden::AppFile("no-cold-paging.txt"));
+            const bool no_cap = std::filesystem::exists(Eden::AppFile("no-staging-cap.txt"));
+            const bool no_skip = std::filesystem::exists(Eden::AppFile("no-stale-skip.txt"));
+            Common::SetGuestMemoryCold(!no_cold);
+            Eden::Performance::no_staging_cap = no_cap;
+            Eden::Performance::no_stale_skip = no_skip;
+            std::fprintf(stderr, "EDEN_SWITCHES cold_paging=%s staging_cap=%s stale_skip=%s\n",
+                         no_cold ? "off" : "on", no_cap ? "off" : "on", no_skip ? "off" : "on");
+            std::fflush(stderr);
+        }
 #ifdef EDEN_DEV_VULKAN
         Eden::Performance::vulkan_cost_enabled = std::filesystem::exists(Eden::AppFile("cost-run.txt"));
         const bool performance_run = std::filesystem::exists(Eden::AppFile("performance-run.txt"));

@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "performance.h"
+#include <atomic>
+#include <cstdint>
+namespace Core { extern std::atomic<std::uint64_t> g_nx2_present_count; }
 #include "crash_report.h"
 #include "stall_watchdog.h"
 #include "storage_paths.h"
@@ -484,6 +487,22 @@ static void RefreshFreeMemory() {
     const PoolView view = ViewOfPool(known, largest, held, target);
     largest_free_block.store(known ? (view.free != 0 ? view.free : 1) : 0, std::memory_order_relaxed);
     graphics_memory_short.store(view.short_memory, std::memory_order_relaxed);
+    // The game's frame rate and the memory it runs in, every 10 s: seconds since the first look,
+    // the guest's presents and their rate since the last line, the pool's largest free block and
+    // the guest's memory (EDEN_STATS).
+    static std::atomic<long long> stats_ns{0}, first_ns{0};
+    static std::atomic<std::uint64_t> stats_presents{0};
+    if (first_ns.load(std::memory_order_relaxed) == 0) first_ns.store(now, std::memory_order_relaxed);
+    if (now - stats_ns.load(std::memory_order_relaxed) >= 10'000'000'000) {
+        const long long last = stats_ns.exchange(now, std::memory_order_relaxed);
+        const std::uint64_t presents = ::Core::g_nx2_present_count.load(std::memory_order_relaxed);
+        const std::uint64_t before = stats_presents.exchange(presents, std::memory_order_relaxed);
+        std::size_t stats_span = 0, stats_guest = 0;
+        ::Common::GuestMemoryUsage(&stats_span, &stats_guest);
+        std::fprintf(stderr, "EDEN_STATS t=%.0f presents=%llu rate=%.1f pool_free=%zu guest=%zu\n",
+                     (now - first_ns.load(std::memory_order_relaxed)) / 1e9, static_cast<unsigned long long>(presents),
+                     last != 0 ? (presents - before) / ((now - last) / 1e9) : 0.0, largest >> 20, stats_guest >> 20);
+    }
     // The pool, the guest's memory and the heap in stderr.log every 20 s, to see what holds it.
     static std::atomic<long long> summary_ns{0};
     if (now - summary_ns.load(std::memory_order_relaxed) >= 20'000'000'000) {

@@ -12,6 +12,14 @@
 //   Fine    the slot is 128 pages of 16 KiB, read-only: its pages of zeroes show the zero block, the
 //           others a compact block that holds only them (a written slot with many pages of zeroes);
 //           a write makes it whole again, and it waits longer each time before it may be Fine again
+//   Watch   an Own slot whose mapping is taken away while its block stays: any access faults, and the
+//           slot shows its block again (the console)
+//   Cold    a Watch slot no access touched for ColdAfterTicks: its bytes are kept LZ4-compressed in
+//           the heap and its block goes back to the pool; an access faults, takes a block and has the
+//           bytes back (the console). Guest memory a game loaded once and no longer reads (Aflakon,
+//           viejunerd/Eglantine-PS5- issue 21: about 5 of 6 GB untouched for minutes in Ocarina)
+//   Paged   the same for a slot that does not compress to half: its 2 MiB are written to a file
+//           (PageFilePath), at the slot's own place in it, and read back when it is touched
 //
 // On the console a Zero slot is only reserved until it is touched: the first access faults and the
 // slot shows the zero block from then on (a write then faults again, as below). The console maps at
@@ -29,7 +37,10 @@
 // 64-bit games only: a 32-bit game's fastmem window aliases the backing, which takes it whole.
 
 namespace {
-enum : std::uint8_t { SlotZero = 0, SlotOwn = 1, SlotShared = 2, SlotFine = 3, SlotLock = 0x80, SlotMask = 0x7f };
+enum : std::uint8_t {
+    SlotZero = 0, SlotOwn = 1, SlotShared = 2, SlotFine = 3, SlotWatch = 4, SlotCold = 5, SlotPaged = 6, SlotLock = 0x80,
+    SlotMask = 0x7f
+};
 constexpr std::size_t FinePage = 16384, FinePages = SparseSlot / FinePage;
 // A written slot becomes Fine with at least this many pages of zeroes (512 KiB given back).
 constexpr std::size_t FineMinZeroPages = 32;
@@ -40,6 +51,8 @@ constexpr unsigned FineBackoffMax = 10;
 // dozen 2 MiB pairs that were written apart within a minute, and with it on a large game held 20 FPS
 // instead of 30 (the GPU worker waited for every fence, once a frame) where it held 30 without.
 std::atomic<bool> service_requested{true}, scan_requested{true}, dedup_requested{false}, fine_requested{false};
+// Watch, Cold and Paged (off: app-folder file no-cold-paging.txt, SetGuestMemoryCold).
+std::atomic<bool> cold_requested{true};
 std::atomic<SparseRange*> service_range{nullptr}; // the guest range the service runs for
 std::atomic<SparseRange*> probe_range{nullptr};   // the self-test's range
 std::atomic<int> service_state{0};                // 0 not tested, 1 works here, 2 does not
@@ -51,13 +64,34 @@ struct Counters {
     std::atomic<std::uint64_t> reserve_used{0}, failures{0}, passes{0}, scan_ns{0};
     std::atomic<std::uint64_t> fined{0}, unfined{0}, fine_failures{0};
     std::atomic<std::uint64_t> shows{0}; // Zero slots that came to show the zero block (a first access)
+    std::atomic<std::uint64_t> watched{0}, watch_hits{0}, colded{0}, cold_hits{0}, cold_kept{0}, cold_failures{0};
+    std::atomic<std::uint64_t> cold_bytes{0}; // what the Cold slots' compressed bytes take now
+    std::atomic<std::uint64_t> paged{0}, page_hits{0}, page_failures{0};
+    // Time (diagnostic, claude/frame-rate-measure): the Watch/Cold ticks, their compression and page
+    // writes, and the longest restore a fault waited for.
+    std::atomic<std::uint64_t> tick_ns{0}, tick_max_ns{0}, compress_ns{0}, write_ns{0}, write_max_ns{0};
+    std::atomic<std::uint64_t> restore_max_ns{0}, restore_ns{0}, restores{0}, read_ns{0}, read_max_ns{0};
+    std::atomic<std::uint64_t> restore_pool_hits{0}, compresses{0}, compress_skips{0}, page_pauses{0};
 };
+std::uint64_t NowNs() noexcept {
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return std::uint64_t(ts.tv_sec) * 1000000000ull + std::uint64_t(ts.tv_nsec);
+}
+void NoteMax(std::atomic<std::uint64_t>& max, std::uint64_t value) noexcept {
+    std::uint64_t seen = max.load(std::memory_order_relaxed);
+    while (value > seen && !max.compare_exchange_weak(seen, value, std::memory_order_relaxed)) {
+    }
+}
 Counters counters;
 void ResetCounters() noexcept {
     for (auto* counter : {&counters.faults, &counters.promotions, &counters.copies, &counters.waits,
                           &counters.returns_clear, &counters.returns_free, &counters.returns_scan, &counters.dedup,
                           &counters.reserve_used, &counters.failures, &counters.passes, &counters.scan_ns,
-                          &counters.fined, &counters.unfined, &counters.fine_failures, &counters.shows})
+                          &counters.fined, &counters.unfined, &counters.fine_failures, &counters.shows,
+                          &counters.watched, &counters.watch_hits, &counters.colded, &counters.cold_hits,
+                          &counters.cold_kept, &counters.cold_failures, &counters.cold_bytes, &counters.paged,
+                          &counters.page_hits, &counters.page_failures})
         counter->store(0, std::memory_order_relaxed);
 }
 
@@ -288,10 +322,25 @@ bool PromoteShared(SparseRange& range, std::size_t slot) noexcept {
 #endif
 }
 
-// Own, Shared or Fine -> Zero: the slot shows the zero block again and its memory goes back.
+void RetireCold(std::size_t slot) noexcept;
+#ifdef PS5_NATIVE
+void GivePagePlace(std::size_t slot) noexcept;
+#endif
+
+// Own, Shared, Fine, Watch or Cold -> Zero: the slot shows the zero block again and its memory goes back.
 void ReturnSlot(SparseRange& range, std::size_t slot) noexcept {
     const std::uintptr_t at = SlotAddress(range, slot);
     const std::uint8_t state = SlotState(range, slot);
+#ifdef PS5_NATIVE
+    if (state == SlotCold || state == SlotPaged) {
+        ShowNothing(range, slot, at);
+        if (state == SlotCold) RetireCold(slot);
+        else GivePagePlace(slot);
+        range.physical[slot] = -1;
+        return;
+    }
+    // A Watch slot is an Own slot not shown: the same below.
+#endif
     if (state == SlotFine) {
         const std::size_t kept = FineKept(range, slot);
 #ifdef PS5_NATIVE
@@ -436,12 +485,247 @@ bool MakeFine(SparseRange& range, std::size_t slot, const bool (&zero)[FinePages
     return true;
 }
 
+// ---- Watch and Cold (the console) ----
+// Ticks of the scanner's Watch/Cold step: every 5 s (the scan of zeroes, Fine and duplicates every 4th).
+constexpr unsigned ColdTickSeconds = 5;
+// A slot no access touched for this many ticks in Watch goes Cold (10 s). At 30 s Ocarina's memory
+// ran out 63 s in, before the first slot was due: 1.3 GiB untouched since about 35 s still waited.
+constexpr std::uint32_t ColdAfterTicks = 2;
+// At most this many Own slots go into Watch a tick (512 MiB), in turn over the range.
+constexpr std::size_t WatchPerTick = 256;
+// A slot that was touched in Watch, or did not compress, waits 1, 2, 4 ... 256 ticks before the next.
+constexpr unsigned WatchBackoffMax = 8;
+// Compressed to at most this (of 2 MiB), a slot stays in memory, Cold; else it is Paged: written to
+// the page file whole (Ocarina, 19:13: 745 of 2,167 cooled slots did not compress to 3/4).
+constexpr std::size_t ColdMaxBytes = SparseSlot / 2;
+// Without the page file, a slot compressed to at most this still goes Cold.
+constexpr std::size_t ColdMaxBytesNoFile = SparseSlot * 3 / 4;
+// The page file: the guest's slots at their own offsets (slot x 2 MiB), only the written ones taking
+// room. Made when the service starts, gone when its range is given back.
+constexpr const char* PageFilePath = "/data/eglantineps5/cache/guest-pages-%02u.bin";
+int page_fd = -1; // the first page file (>= 0: paging is on)
+// The page file is PageFiles files, place p in file p % PageFiles at (p / PageFiles) x 2 MiB: one file's
+// write holds it locked, and a restore reading another slot of the same file waited for it. On an idle
+// console a 2 MiB write takes 14 ms and a read 0.5 to 1.4 ms (EDEN_PAGE_IO, 11-07 21:10); in gameplay,
+// one file written all the time, both took about 140 ms.
+constexpr std::size_t PageFiles = 16;
+int page_fds[PageFiles] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+int PageFd(std::size_t place) noexcept {
+    return page_fds[place % PageFiles];
+}
+off_t PageOffset(std::size_t place, std::size_t done) noexcept {
+    return static_cast<off_t>((place / PageFiles) * SparseSlot + done);
+}
+// At most this many slots are written to the page files a tick (32 MiB in 5 s), so paging never fills
+// the storage's queue while the game loads from it.
+constexpr unsigned PagesPerTick = 16;
+// While the pool is short: 64 slots a tick (128 MiB in 5 s, a write takes about 9 ms).
+constexpr unsigned PagesPerTickShort = 64;
+// A write slower than this means the storage is busy (with the game's own loading, or with this
+// paging): no more slots are written this tick or the next. At 22:50, 64 a tick while short made
+// writes take up to 938 ms and restores 5.7 ms on average, and the game nearly froze for 40 s.
+constexpr std::uint64_t PageSlowWriteNs = 50'000'000;
+std::uint32_t page_resume_tick = 0;
+unsigned pages_this_tick = 0;
+// At most this many slots are compressed a tick (about 5 ms each). Slots over it wait for the next
+// tick; they only get older. At 21:23 the scanner spent 1.3 s a tick compressing, most of it on
+// slots compressed again every tick because they did not compress to half and were not yet old
+// enough to page: a slot in Watch is not touched (a touch ends Watch), so one result holds.
+constexpr unsigned CompressPerTick = 96;
+unsigned compresses_this_tick = 0;
+// A slot that does not compress to half is Paged only while the pool is short (its largest free
+// block under PageShortBytes) or once no access touched it for PageAfterTicks (30 s); until then it
+// stays in Watch. Paged after 10 s, Ocarina read back 492 of 857 paged slots and its gameplay ran at
+// 4 to 15 frames a second (19:21).
+// 30 s (and at once while short) paged too eagerly: in gameplay the pool is short all the time, and
+// half of what was paged was read back, each read a stall (20:41: 626 of 1,243). Then 2 minutes
+// untouched, 1 minute while the pool is short. With 16 page files a read back takes about 1 ms, not
+// 137 (21:23), and waiting a minute left the gameplay load with nothing paged: the guest grew from 4
+// to 5 GiB in 10 s and the pool ran out (22:08, 22:19). Now 30 s untouched, 15 s while short.
+constexpr std::uint32_t PageAfterTicks = 6;
+constexpr std::uint32_t PageAfterTicksShort = 3;
+constexpr std::size_t PageShortBytes = std::size_t{1} << 30;
+// Places in the page file: a paged slot takes the lowest free one and gives it back when read back
+// or given back, so the file stays compact and most writes go over room the file already has. At
+// the slot's own offset in a sparse file, writes ran at 17 MB/s (20:41).
+std::atomic<std::uint8_t>* page_place_used = nullptr;
+// Blocks kept for restores: a block a slot gives back as it goes Cold or Paged comes here first
+// (RestorePoolBlocks at most), and a restore takes one before asking the pool, so it does not
+// wait for the graphics caches while the pool is short (20:41: restores of 47 ms on average, the
+// longest 2.9 s).
+constexpr std::size_t RestorePoolBlocks = 32;
+std::int64_t restore_pool[RestorePoolBlocks];
+std::atomic<std::size_t> restore_pool_count{0};
+std::atomic_flag restore_pool_lock = ATOMIC_FLAG_INIT;
+std::atomic<bool> pool_short{false};
+
+struct ColdSlot {
+    std::vector<std::uint8_t>* data = nullptr;                 // a Cold slot's compressed bytes
+    std::atomic<std::vector<std::uint8_t>*> retired{nullptr};  // bytes a fault has used, freed by the scanner
+    std::uint32_t since = 0;                                    // the tick it went into Watch
+    std::uint32_t next = 0;                                     // the first tick it may go into Watch again
+    std::uint8_t times = 0;                                     // backoffs so far
+    std::int32_t place = -1;                                    // a Paged slot's place in the page file
+    bool too_big = false;                                       // in this Watch, did not compress to half
+};
+ColdSlot* cold_slots = nullptr;
+std::size_t cold_slot_count = 0;
+std::atomic<std::uint32_t> cold_tick{0};
+
+void ColdBackoff(std::size_t slot) noexcept {
+    ColdSlot& cold = cold_slots[slot];
+    cold.times = static_cast<std::uint8_t>(std::min<unsigned>(cold.times + 1u, WatchBackoffMax));
+    cold.next = cold_tick.load(std::memory_order_relaxed) + (1u << cold.times);
+}
+#ifdef PS5_NATIVE
+// The lowest free place in the page file (the scanner), -1 when none.
+std::int32_t TakePagePlace() noexcept {
+    if (page_place_used == nullptr) return -1;
+    for (std::size_t place = 0; place < cold_slot_count; ++place) {
+        std::uint8_t free_place = 0;
+        if (page_place_used[place].compare_exchange_strong(free_place, 1, std::memory_order_acq_rel))
+            return static_cast<std::int32_t>(place);
+    }
+    return -1;
+}
+void GivePagePlace(std::size_t slot) noexcept {
+    ColdSlot& cold = cold_slots[slot];
+    if (cold.place >= 0 && page_place_used != nullptr)
+        page_place_used[cold.place].store(0, std::memory_order_release);
+    cold.place = -1;
+}
+// A block for a restore, from the kept ones (true), else false.
+bool TakeRestoreBlock(std::int64_t* physical) noexcept {
+    Spin(restore_pool_lock);
+    const std::size_t count = restore_pool_count.load(std::memory_order_relaxed);
+    const bool ok = count > 0;
+    if (ok) {
+        *physical = restore_pool[count - 1];
+        restore_pool_count.store(count - 1, std::memory_order_relaxed);
+    }
+    restore_pool_lock.clear(std::memory_order_release);
+    if (ok) counters.restore_pool_hits.fetch_add(1, std::memory_order_relaxed);
+    return ok;
+}
+// A block a slot gave back: kept for restores while there is room, else back to the pool.
+void GiveBlock(std::int64_t physical) noexcept {
+    Spin(restore_pool_lock);
+    const std::size_t count = restore_pool_count.load(std::memory_order_relaxed);
+    const bool kept = count < RestorePoolBlocks;
+    if (kept) {
+        restore_pool[count] = physical;
+        restore_pool_count.store(count + 1, std::memory_order_relaxed);
+    }
+    restore_pool_lock.clear(std::memory_order_release);
+    if (!kept && sceKernelReleaseDirectMemory(physical, SparseSlot) != 0) std::abort();
+}
+#endif
+
+// A Cold slot given back (cleared or freed): its bytes go to the scanner to free.
+void RetireCold(std::size_t slot) noexcept {
+    ColdSlot& cold = cold_slots[slot];
+    if (cold.data == nullptr) return;
+    counters.cold_bytes.fetch_sub(cold.data->size(), std::memory_order_relaxed);
+    cold.retired.store(cold.data, std::memory_order_release);
+    cold.data = nullptr;
+}
+
+#ifdef PS5_NATIVE
+// Watch -> Own: the slot shows its block again, read-write (the slot is locked).
+bool RestoreWatch(SparseRange& range, std::size_t slot) noexcept {
+    if (!MapSlot(SlotAddress(range, slot), PROT_READ | PROT_WRITE, range.physical[slot])) return false;
+    ColdBackoff(slot);
+    counters.watch_hits.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+// Cold -> Own: a block, its bytes back, read-write (the slot is locked). No allocation or free here:
+// it runs in the fault handler; the compressed bytes go to `retired`, for the scanner.
+bool RestoreCold(SparseRange& range, std::size_t slot) noexcept {
+    ColdSlot& cold = cold_slots[slot];
+    std::int64_t physical = -1;
+    if (!TakeRestoreBlock(&physical) && eden_direct_low(SparseSlot, SparseSlot, 12, &physical) != 0 &&
+        !ReserveBlock(&physical))
+        return false;
+    void* view = reinterpret_cast<void*>(cpu_mapping_hint);
+    if (sceKernelMapDirectMemory(&view, SparseSlot, PROT_READ | PROT_WRITE, 0, physical, SparseSlot) != 0) {
+        (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
+        return false;
+    }
+    const int written = guest_memory_decompress.load(std::memory_order_acquire)(view, SparseSlot, cold.data->data(),
+                                                                                cold.data->size());
+    if (written != static_cast<int>(SparseSlot)) std::abort(); // the bytes are the guest's: never lose them
+    if (munmap(view, SparseSlot) != 0) std::abort();
+    if (!MapSlot(SlotAddress(range, slot), PROT_READ | PROT_WRITE, physical)) {
+        (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
+        return false;
+    }
+    range.physical[slot] = physical;
+    guest_committed.fetch_add(SparseSlot, std::memory_order_relaxed);
+    counters.cold_bytes.fetch_sub(cold.data->size(), std::memory_order_relaxed);
+    cold.retired.store(cold.data, std::memory_order_release);
+    cold.data = nullptr;
+    ColdBackoff(slot);
+    counters.cold_hits.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+// Paged -> Own: a block, its 2 MiB read back from the page file (pread: a system call, as the fault
+// handler may make). A read that fails loses the guest's bytes: the app stops rather than go on
+// with them wrong.
+bool RestorePaged(SparseRange& range, std::size_t slot) noexcept {
+    std::int64_t physical = -1;
+    if (!TakeRestoreBlock(&physical) && eden_direct_low(SparseSlot, SparseSlot, 12, &physical) != 0 &&
+        !ReserveBlock(&physical))
+        return false;
+    void* view = reinterpret_cast<void*>(cpu_mapping_hint);
+    if (sceKernelMapDirectMemory(&view, SparseSlot, PROT_READ | PROT_WRITE, 0, physical, SparseSlot) != 0) {
+        (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
+        return false;
+    }
+    const std::uint64_t read_began = NowNs();
+    const std::size_t place = static_cast<std::size_t>(cold_slots[slot].place);
+    std::size_t done = 0;
+    while (done < SparseSlot) {
+        const ssize_t got = pread(PageFd(place), static_cast<std::uint8_t*>(view) + done, SparseSlot - done,
+                                  PageOffset(place, done));
+        if (got <= 0) {
+            if (got < 0 && errno == EINTR) continue;
+            Note("EDEN_CRAM a paged slot of the guest's memory could not be read back from the page file\n");
+            std::abort();
+        }
+        done += static_cast<std::size_t>(got);
+    }
+    const std::uint64_t read_took = NowNs() - read_began;
+    counters.read_ns.fetch_add(read_took, std::memory_order_relaxed);
+    NoteMax(counters.read_max_ns, read_took);
+    if (munmap(view, SparseSlot) != 0) std::abort();
+    if (!MapSlot(SlotAddress(range, slot), PROT_READ | PROT_WRITE, physical)) {
+        (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
+        return false;
+    }
+    range.physical[slot] = physical;
+    guest_committed.fetch_add(SparseSlot, std::memory_order_relaxed);
+    GivePagePlace(slot);
+    ColdBackoff(slot);
+    counters.page_hits.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+#endif
+
 // CommitSparsePage for a range with slot states.
 bool ServiceCommit(SparseRange& range, std::size_t slot) noexcept {
     LockSlot(range, slot);
     const std::uint8_t state = SlotState(range, slot);
-    const bool ok = state == SlotZero ? PromoteZero(range, slot) : state == SlotFine ? PromoteFine(range, slot) : true;
-    UnlockSlot(range, slot, ok && (state == SlotZero || state == SlotFine) ? SlotOwn : state);
+    bool ok = state == SlotZero ? PromoteZero(range, slot) : state == SlotFine ? PromoteFine(range, slot) : true;
+#ifdef PS5_NATIVE
+    if (state == SlotWatch) ok = RestoreWatch(range, slot);
+    else if (state == SlotCold) ok = RestoreCold(range, slot);
+    else if (state == SlotPaged) ok = RestorePaged(range, slot);
+#endif
+    const bool now_own =
+        state == SlotZero || state == SlotFine || state == SlotWatch || state == SlotCold || state == SlotPaged;
+    UnlockSlot(range, slot, ok && now_own ? SlotOwn : state);
     return ok;
 }
 
@@ -654,8 +938,33 @@ bool HandleGuestWriteFault(void* fault) noexcept {
         return true;
     }
 #endif
+#ifdef PS5_NATIVE
+    // A slot being watched was touched: it shows its block again.
+    if (state == SlotWatch) {
+        const bool shown = RestoreWatch(*range, slot);
+        UnlockSlot(*range, slot, shown ? SlotOwn : state);
+        if (!shown) {
+            Refused(address, 4, state);
+            Note("EDEN_CRAM a watched slot of the guest's memory could not show its block again\n");
+            return false;
+        }
+        repeats = 0;
+        return true;
+    }
+#endif
     const auto promote = [&]() noexcept {
         bool done = true;
+#ifdef PS5_NATIVE
+        if (state == SlotCold || state == SlotPaged) {
+            const std::uint64_t began = NowNs();
+            const bool restored = state == SlotCold ? RestoreCold(*range, slot) : RestorePaged(*range, slot);
+            const std::uint64_t took = NowNs() - began;
+            counters.restore_ns.fetch_add(took, std::memory_order_relaxed);
+            counters.restores.fetch_add(1, std::memory_order_relaxed);
+            NoteMax(counters.restore_max_ns, took);
+            return restored;
+        }
+#endif
         if (state == SlotFine) {
             done = PromoteFine(*range, slot);
         } else if (state == SlotZero) {
@@ -808,6 +1117,173 @@ void HideZeroSlots(SparseRange& range) noexcept {
 #endif
 
 // ---- The scanner ----
+#ifdef PS5_NATIVE
+// Own -> Watch: the slot's mapping goes (its block stays); the next access faults (RestoreWatch).
+bool WatchSlot(SparseRange& range, std::size_t slot, std::uint32_t tick) noexcept {
+    LockSlot(range, slot);
+    if (SlotState(range, slot) != SlotOwn || tick < cold_slots[slot].next) {
+        UnlockSlot(range, slot, SlotState(range, slot));
+        return false;
+    }
+    if (!HideSlots(SlotAddress(range, slot), SparseSlot)) {
+        UnlockSlot(range, slot, SlotOwn);
+        return false;
+    }
+    cold_slots[slot].since = tick;
+    cold_slots[slot].too_big = false;
+    UnlockSlot(range, slot, SlotWatch);
+    counters.watched.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+// Watch -> Cold: a slot no access touched since it went into Watch is compressed and its block goes
+// back. One that does not compress shows its block again and waits.
+bool CoolSlot(SparseRange& range, std::size_t slot, std::uint32_t idle) noexcept {
+    LockSlot(range, slot);
+    if (SlotState(range, slot) != SlotWatch) {
+        UnlockSlot(range, slot, SlotState(range, slot));
+        return false;
+    }
+    const bool short_now = pool_short.load(std::memory_order_relaxed);
+    const bool may_page = page_fd >= 0 && pages_this_tick < (short_now ? PagesPerTickShort : PagesPerTick) &&
+                          cold_tick.load(std::memory_order_relaxed) >= page_resume_tick &&
+                          (idle >= PageAfterTicks || (idle >= PageAfterTicksShort && short_now));
+    const bool too_big = cold_slots[slot].too_big;
+    if ((too_big && !may_page) || (!too_big && compresses_this_tick >= CompressPerTick)) {
+        // Known not to compress to half and not old enough to page, or out of this tick's
+        // compressions: it stays in Watch untouched.
+        if (too_big) counters.compress_skips.fetch_add(1, std::memory_order_relaxed);
+        UnlockSlot(range, slot, SlotWatch);
+        return false;
+    }
+    const std::int64_t physical = range.physical[slot];
+    void* view = reinterpret_cast<void*>(cpu_mapping_hint);
+    bool cooled = false;
+    if (sceKernelMapDirectMemory(&view, SparseSlot, PROT_READ, 0, physical, SparseSlot) == 0) {
+        // The scanner's own room for one slot compressed (LZ4's bound for 2 MiB).
+        static std::vector<std::uint8_t> room(SparseSlot + SparseSlot / 255 + 16);
+        std::size_t packed = 0;
+        if (too_big) {
+            counters.compress_skips.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            ++compresses_this_tick;
+            counters.compresses.fetch_add(1, std::memory_order_relaxed);
+            const std::uint64_t compress_began = NowNs();
+            packed = guest_memory_compress.load(std::memory_order_acquire)(view, SparseSlot, room.data(), room.size());
+            counters.compress_ns.fetch_add(NowNs() - compress_began, std::memory_order_relaxed);
+        }
+        // Not to half: the page file takes it whole, where there is one.
+        bool written = false;
+        if ((packed == 0 || packed > ColdMaxBytes) && page_fd >= 0 && !may_page) {
+            // Not to half, and not to be paged yet: it stays in Watch, its block kept, and is not
+            // compressed again while it stays there.
+            cold_slots[slot].too_big = true;
+            if (munmap(view, SparseSlot) != 0) std::abort();
+            UnlockSlot(range, slot, SlotWatch);
+            return false;
+        }
+        const std::int32_t place = (packed == 0 || packed > ColdMaxBytes) && may_page ? TakePagePlace() : -1;
+        if (place >= 0) {
+            const std::uint64_t write_began = NowNs();
+            std::size_t done = 0;
+            while (done < SparseSlot) {
+                const ssize_t put = pwrite(PageFd(std::size_t(place)), static_cast<const std::uint8_t*>(view) + done,
+                                           SparseSlot - done, PageOffset(std::size_t(place), done));
+                if (put <= 0) {
+                    if (put < 0 && errno == EINTR) continue;
+                    break;
+                }
+                done += static_cast<std::size_t>(put);
+            }
+            written = done == SparseSlot;
+            ++pages_this_tick;
+            if (written) cold_slots[slot].place = place;
+            else {
+                counters.page_failures.fetch_add(1, std::memory_order_relaxed);
+                page_place_used[place].store(0, std::memory_order_release);
+            }
+            const std::uint64_t write_took = NowNs() - write_began;
+            counters.write_ns.fetch_add(write_took, std::memory_order_relaxed);
+            if (write_took > PageSlowWriteNs) {
+                page_resume_tick = cold_tick.load(std::memory_order_relaxed) + 2;
+                counters.page_pauses.fetch_add(1, std::memory_order_relaxed);
+            }
+            NoteMax(counters.write_max_ns, write_took);
+        }
+        if (munmap(view, SparseSlot) != 0) std::abort();
+        if (written) {
+            GiveBlock(physical);
+            range.physical[slot] = -1;
+            guest_committed.fetch_sub(SparseSlot, std::memory_order_relaxed);
+            counters.paged.fetch_add(1, std::memory_order_relaxed);
+            UnlockSlot(range, slot, SlotPaged);
+            return true;
+        }
+        if (packed != 0 && packed <= (page_fd >= 0 ? ColdMaxBytes : ColdMaxBytesNoFile)) {
+            cold_slots[slot].data =
+                new (std::nothrow) std::vector<std::uint8_t>(room.begin(), room.begin() + static_cast<std::ptrdiff_t>(packed));
+            if (cold_slots[slot].data != nullptr) {
+                GiveBlock(physical);
+                range.physical[slot] = -1;
+                guest_committed.fetch_sub(SparseSlot, std::memory_order_relaxed);
+                counters.cold_bytes.fetch_add(cold_slots[slot].data->size(), std::memory_order_relaxed);
+                counters.colded.fetch_add(1, std::memory_order_relaxed);
+                cooled = true;
+            }
+        } else {
+            counters.cold_kept.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else {
+        counters.cold_failures.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!cooled) {
+        // Shown again; a slot that does not compress waits the longest before it is looked at again.
+        if (!MapSlot(SlotAddress(range, slot), PROT_READ | PROT_WRITE, physical)) std::abort();
+        cold_slots[slot].times = WatchBackoffMax;
+        cold_slots[slot].next = cold_tick.load(std::memory_order_relaxed) + (1u << WatchBackoffMax);
+    }
+    UnlockSlot(range, slot, cooled ? SlotCold : SlotOwn);
+    return cooled;
+}
+
+// One Watch/Cold tick: the bytes faults used are freed, watched slots untouched long enough go
+// Cold, and the next Own slots in turn go into Watch.
+void ColdTickBody(SparseRange& range) noexcept;
+void ColdTick(SparseRange& range) noexcept {
+    if (cold_slots == nullptr || guest_memory_compress.load(std::memory_order_acquire) == nullptr) return;
+    if (!cold_requested.load(std::memory_order_relaxed)) return; // no slot goes into Watch
+    const std::uint64_t began = NowNs();
+    ColdTickBody(range);
+    const std::uint64_t took = NowNs() - began;
+    counters.tick_ns.fetch_add(took, std::memory_order_relaxed);
+    NoteMax(counters.tick_max_ns, took);
+}
+void ColdTickBody(SparseRange& range) noexcept {
+    pages_this_tick = 0;
+    compresses_this_tick = 0;
+    const std::uint32_t tick = cold_tick.fetch_add(1, std::memory_order_relaxed) + 1;
+    {
+        const std::int64_t total = sceKernelGetDirectMemorySize();
+        std::int64_t start = 0;
+        std::size_t largest = 0;
+        pool_short.store(total > 0 && sceKernelAvailableDirectMemorySize(0, total, 0x4000, &start, &largest) == 0 &&
+                             largest < PageShortBytes,
+                         std::memory_order_relaxed);
+    }
+    static std::size_t cursor = 0;
+    for (std::size_t slot = 0; slot < cold_slot_count; ++slot) {
+        if (auto* retired = cold_slots[slot].retired.exchange(nullptr, std::memory_order_acq_rel)) delete retired;
+        if (SlotState(range, slot) == SlotWatch && tick - cold_slots[slot].since >= ColdAfterTicks)
+            (void)CoolSlot(range, slot, tick - cold_slots[slot].since);
+    }
+    std::size_t watched = 0;
+    for (std::size_t seen = 0; seen < cold_slot_count && watched < WatchPerTick; ++seen) {
+        cursor = (cursor + 1) % cold_slot_count;
+        if (SlotState(range, cursor) == SlotOwn && tick >= cold_slots[cursor].next) watched += WatchSlot(range, cursor, tick);
+    }
+}
+#endif
+
 std::thread scanner;
 std::mutex scanner_mutex;
 std::condition_variable scanner_wake;
@@ -985,12 +1461,15 @@ void ScanPass(SparseRange& range) noexcept {
 
 void ServiceReport(SparseRange& range, const char* when) noexcept {
     const std::size_t slots = (range.end - range.begin.load(std::memory_order_relaxed)) / SparseSlot;
-    std::size_t own = 0, shared = 0, fine = 0, fine_kept = 0, zero_shown = 0;
+    std::size_t own = 0, shared = 0, fine = 0, fine_kept = 0, zero_shown = 0, watch = 0, cold = 0, paged = 0;
     for (std::size_t slot = 0; slot < slots; ++slot) {
         const auto state = SlotState(range, slot);
         zero_shown += state == SlotZero && (range.shown == nullptr || range.shown[slot].load(std::memory_order_relaxed));
         own += state == SlotOwn;
         shared += state == SlotShared;
+        watch += state == SlotWatch;
+        cold += state == SlotCold;
+        paged += state == SlotPaged;
         if (state == SlotFine) {
             ++fine;
             fine_kept += FineKept(range, slot);
@@ -1002,7 +1481,8 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
         "returns_clear=%llu returns_free=%llu returns_scan=%llu dedup=%llu reserve_used=%llu failures=%llu "
         "passes=%llu scan_ms=%llu fine=%zu fine_held=%zuMiB fined=%llu unfined=%llu fine_failures=%llu "
         "reserve=%zuMiB\n",
-        when, guest_committed.load(std::memory_order_relaxed) >> 20, own, shared, slots - own - shared - fine,
+        when, guest_committed.load(std::memory_order_relaxed) >> 20, own, shared,
+        slots - own - shared - fine - watch - cold - paged,
         zero_shown, (unsigned long long)counters.shows.load(),
         (unsigned long long)counters.faults.load(), (unsigned long long)counters.promotions.load(),
         (unsigned long long)counters.copies.load(), (unsigned long long)counters.waits.load(),
@@ -1014,6 +1494,38 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
         (unsigned long long)counters.unfined.load(), (unsigned long long)counters.fine_failures.load(),
         reserve_count.load(std::memory_order_relaxed) * (SparseSlot >> 20));
     if (length > 0) Report(line);
+    {
+        char cold_line[512];
+        const int cold_length = std::snprintf(cold_line, sizeof(cold_line),
+            "EDEN_CRAM_COLD %s watch=%zu cold=%zu (%zu MiB of slots in %llu MiB) paged=%zu (%zu MiB) watched=%llu "
+            "touched=%llu cooled=%llu restored=%llu paged_out=%llu paged_in=%llu page_failures=%llu "
+            "incompressible=%llu failures=%llu\n",
+            when, watch, cold, cold * (SparseSlot >> 20), (unsigned long long)(counters.cold_bytes.load() >> 20), paged,
+            paged * (SparseSlot >> 20), (unsigned long long)counters.watched.load(),
+            (unsigned long long)counters.watch_hits.load(), (unsigned long long)counters.colded.load(),
+            (unsigned long long)counters.cold_hits.load(), (unsigned long long)counters.paged.load(),
+            (unsigned long long)counters.page_hits.load(), (unsigned long long)counters.page_failures.load(),
+            (unsigned long long)counters.cold_kept.load(), (unsigned long long)counters.cold_failures.load());
+        if (cold_length > 0) Report(cold_line);
+        const auto ms = [](const std::atomic<std::uint64_t>& ns) {
+            return static_cast<unsigned long long>(ns.load(std::memory_order_relaxed) / 1000000);
+        };
+        const unsigned long long restores = counters.restores.load(std::memory_order_relaxed);
+        const int time_length = std::snprintf(cold_line, sizeof(cold_line),
+            "EDEN_CRAM_TIME %s ticks=%u tick_ms=%llu tick_max_ms=%llu compress_ms=%llu write_ms=%llu write_max_ms=%llu "
+            "restores=%llu restore_avg_us=%llu restore_max_ms=%llu read_ms=%llu read_max_ms=%llu kept_blocks=%zu "
+            "kept_hits=%llu compresses=%llu compress_skips=%llu page_pauses=%llu\n",
+            when, cold_tick.load(std::memory_order_relaxed), ms(counters.tick_ns), ms(counters.tick_max_ns),
+            ms(counters.compress_ns), ms(counters.write_ns), ms(counters.write_max_ns), restores,
+            restores ? (unsigned long long)(counters.restore_ns.load() / 1000 / restores) : 0ull,
+            ms(counters.restore_max_ns), ms(counters.read_ns), ms(counters.read_max_ns),
+            restore_pool_count.load(std::memory_order_relaxed),
+            (unsigned long long)counters.restore_pool_hits.load(std::memory_order_relaxed),
+            (unsigned long long)counters.compresses.load(std::memory_order_relaxed),
+            (unsigned long long)counters.compress_skips.load(std::memory_order_relaxed),
+            (unsigned long long)counters.page_pauses.load(std::memory_order_relaxed));
+        if (time_length > 0) Report(cold_line);
+    }
 #ifdef PS5_NATIVE
     // The pool as well, from this thread: the GPU thread reports it every 20 s (headless/performance.cpp),
     // and a session whose GPU thread stopped showed nothing after that.
@@ -1095,11 +1607,15 @@ void MeasureFinePages(SparseRange& range) noexcept {
 void ScannerLoop(SparseRange* range) {
     auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     std::unique_lock lock{scanner_mutex};
+    unsigned wakes = 0;
     while (!scanner_stop) {
-        scanner_wake.wait_for(lock, std::chrono::seconds(20), [] { return scanner_stop; });
+        scanner_wake.wait_for(lock, std::chrono::seconds(ColdTickSeconds), [] { return scanner_stop; });
         if (scanner_stop) break;
         lock.unlock();
-        if (scan_requested.load(std::memory_order_relaxed)) ScanPass(*range);
+#ifdef PS5_NATIVE
+        ColdTick(*range);
+#endif
+        if (++wakes % 4 == 0 && scan_requested.load(std::memory_order_relaxed)) ScanPass(*range);
         if (std::chrono::steady_clock::now() >= next_report) {
             ServiceReport(*range, "now");
             next_report = std::chrono::steady_clock::now() + std::chrono::seconds(30);
@@ -1233,6 +1749,35 @@ void ServiceStart(SparseRange& range) noexcept {
         return;
     }
     ResetCounters();
+    // Watch and Cold (the console): a record a slot.
+    cold_slot_count = (range.end - range.begin.load(std::memory_order_relaxed)) / SparseSlot;
+    cold_slots = new (std::nothrow) ColdSlot[cold_slot_count];
+    if (cold_slots == nullptr) cold_slot_count = 0;
+    cold_tick.store(0, std::memory_order_relaxed);
+#ifdef PS5_NATIVE
+    if (page_fd < 0) {
+        bool opened = true;
+        for (std::size_t file = 0; file < PageFiles && opened; ++file) {
+            char path[96];
+            std::snprintf(path, sizeof(path), PageFilePath, unsigned(file));
+            page_fds[file] = open(path, O_RDWR | O_CREAT | O_TRUNC, 0666);
+            opened = page_fds[file] >= 0;
+        }
+        if (opened) {
+            page_fd = page_fds[0];
+        } else {
+            for (int& fd : page_fds)
+                if (fd >= 0) (void)close(fd), fd = -1;
+            Note("EDEN_CRAM no page file: slots that do not compress stay in memory\n");
+        }
+    }
+    page_place_used = new (std::nothrow) std::atomic<std::uint8_t>[cold_slot_count]();
+    if (page_place_used == nullptr && page_fd >= 0) {
+        for (int& fd : page_fds)
+            if (fd >= 0) (void)close(fd), fd = -1;
+        page_fd = -1;
+    }
+#endif
     range.promote = true;
 #ifdef PS5_NATIVE
     reserve_lent.store(0, std::memory_order_relaxed);
@@ -1288,14 +1833,43 @@ void ReleaseServiceBlocks(SparseRange& range) noexcept {
             const std::size_t kept = FineKept(range, slot);
             if (kept != 0 && sceKernelReleaseDirectMemory(range.physical[slot], kept * FinePage) != 0) std::abort();
             guest_committed.fetch_sub(kept * FinePage, std::memory_order_relaxed);
-        } else if (state == SlotOwn) {
+        } else if (state == SlotOwn || state == SlotWatch) {
             if (sceKernelReleaseDirectMemory(range.physical[slot], SparseSlot) != 0) std::abort();
+        } else if (state == SlotCold) {
+            if (cold_slots != nullptr && slot < cold_slot_count) {
+                delete cold_slots[slot].data;
+                cold_slots[slot].data = nullptr;
+            }
         } else if (state == SlotShared && UnshareBlock(range.physical[slot]) == 0) {
             if (sceKernelReleaseDirectMemory(range.physical[slot], SparseSlot) != 0) std::abort();
             guest_committed.fetch_sub(SparseSlot, std::memory_order_relaxed);
         }
-        if (state == SlotOwn) guest_committed.fetch_sub(SparseSlot, std::memory_order_relaxed);
+        if (state == SlotOwn || state == SlotWatch) guest_committed.fetch_sub(SparseSlot, std::memory_order_relaxed);
         range.owned[slot].store(false, std::memory_order_relaxed);
+    }
+    if (cold_slots != nullptr) {
+        for (std::size_t slot = 0; slot < cold_slot_count; ++slot) delete cold_slots[slot].retired.exchange(nullptr);
+        delete[] cold_slots;
+        cold_slots = nullptr;
+        cold_slot_count = 0;
+        counters.cold_bytes.store(0, std::memory_order_relaxed);
+    }
+    if (page_fd >= 0) {
+        for (std::size_t file = 0; file < PageFiles; ++file) {
+            (void)close(page_fds[file]);
+            page_fds[file] = -1;
+            char path[96];
+            std::snprintf(path, sizeof(path), PageFilePath, unsigned(file));
+            (void)unlink(path);
+        }
+        page_fd = -1;
+    }
+    delete[] page_place_used;
+    page_place_used = nullptr;
+    while (restore_pool_count.load(std::memory_order_relaxed) > 0) {
+        const std::size_t count = restore_pool_count.load(std::memory_order_relaxed);
+        if (sceKernelReleaseDirectMemory(restore_pool[count - 1], SparseSlot) != 0) std::abort();
+        restore_pool_count.store(count - 1, std::memory_order_relaxed);
     }
 #else
     const std::size_t slots = (range.end - range.begin.load(std::memory_order_relaxed)) / SparseSlot;
@@ -1323,6 +1897,13 @@ void SetGuestMemoryService(bool on, bool scan, bool dedup) noexcept {
 // waits for it to be made whole (a fault and a 2 MiB copy, about 0.3 ms).
 void SetGuestMemoryFine(bool on) noexcept {
     fine_requested.store(on, std::memory_order_relaxed);
+}
+
+// App-folder file no-cold-paging.txt: no slot goes into Watch, so none is compressed (Cold) or
+// written to the page file (Paged); the rest of the service is as before. To tell apart what a
+// rendering fault comes from.
+void SetGuestMemoryCold(bool on) noexcept {
+    cold_requested.store(on, std::memory_order_relaxed);
 }
 
 // The guest's kernel hands pages out: they are committed now only without the service.

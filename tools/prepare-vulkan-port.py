@@ -192,8 +192,6 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         prepared_pipeline = nullptr;
     };
     // update engine as channel may be different.'''),
-    ('        if (auto* gp = pipeline_cache.CurrentGraphicsPipeline(); gp && gp->HasDynamicVertexInput()) {',
-     '        if (auto* gp = prepared_pipeline ? prepared_pipeline : pipeline_cache.CurrentGraphicsPipeline();\n            gp && gp->HasDynamicVertexInput()) {'),
     # Development GPU fault probe (dev_vulkan.h, pipeline_trace=on): once the runner
     # creates /app0/sync-draws.txt, report every draw/dispatch to klog and wait for the
     # GPU, so the last report before a fatal GPU fault names the operation.
@@ -529,14 +527,16 @@ adapt('src/video_core/vulkan_common/vulkan_memory_allocator.cpp', 'vulkan_memory
      '    if (text != nullptr) { ::Eden::Performance::WriteLogFile("vma-refused.json", text); vmaFreeStatsString(allocator, text); }\n'
      '} }\n'),
     # What an image was that the allocator could not make at all, for stderr.log.
-    ('    if (result != VK_SUCCESS) {\n        LOG_CRITICAL(Render_Vulkan, "Image {}x{}x{} ({} levels, {} layers, format {}) failed: {}",',
+    # (Lichii #440 returns the failure instead of throwing: the texture cache then leaves the
+    # image out and makes it again after collecting.)
+    ('    if (result != VK_SUCCESS) {\n        failed_images.fetch_add(1, std::memory_order_relaxed);',
      """    if (result != VK_SUCCESS) {
+        failed_images.fetch_add(1, std::memory_order_relaxed);
         std::fprintf(stderr, "EDEN_IMAGE_REFUSED %ux%ux%u, %u layers, %u levels, format %d, type %d, usage 0x%x, flags 0x%x, "
                      "tiling %d, samples %d, result %d, huge %d, texels %llu\\n",
                      ci.extent.width, ci.extent.height, ci.extent.depth, ci.arrayLayers, ci.mipLevels, int(ci.format),
                      int(ci.imageType), unsigned(ci.usage), unsigned(ci.flags), int(ci.tiling), int(ci.samples),
-                     int(result), int(huge), static_cast<unsigned long long>(texels));
-        LOG_CRITICAL(Render_Vulkan, "Image {}x{}x{} ({} levels, {} layers, format {}) failed: {}","""),
+                     int(result), int(huge), static_cast<unsigned long long>(texels));"""),
     # An image with nothing bound (the sparse virtual texture arrays no pool could hold): when the driver refuses
     # it with residency, it is asked for again with binding alone, and what it said is written down.
     ('    if (device.GetDispatchLoader().vkCreateImage(*device.GetLogical(), &sparse_ci, nullptr,\n'
@@ -637,6 +637,18 @@ adapt('src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp', 'vulkan_stagi
      '        }\n'
      '        staging_released_bytes.fetch_add(released.bytes, std::memory_order_relaxed);\n'
      '        return;\n'
+     '    }\n'
+     '    // At most kIdleCap of idle buffers kept, none while memory is short (staging_buffers.h);\n'
+     '    // not with the switch file no-staging-cap.txt.\n'
+     '    if (!::Eden::Performance::no_staging_cap.load(std::memory_order_relaxed)) {\n'
+     '        const auto idle = [this](const StagingBuffer& entry) {\n'
+     '            return !entry.deferred && scheduler.IsFree(entry.tick);\n'
+     '        };\n'
+     '        StagingBuffersCache* const caches[]{&device_local_cache, &upload_cache, &download_cache};\n'
+     '        const bool short_memory = ::Eden::Performance::graphics_memory_short.load(std::memory_order_relaxed);\n'
+     '        const ::Eden::StagingBuffers::Released capped = ::Eden::StagingBuffers::CapIdle(\n'
+     '            caches, idle, short_memory ? 0 : ::Eden::StagingBuffers::kIdleCap);\n'
+     '        staging_released_bytes.fetch_add(capped.bytes, std::memory_order_relaxed);\n'
      '    }\n'
      '    current_delete_level = (current_delete_level + 1) % NUM_LEVELS;\n'),
     ('    const auto is_free = [this](const StagingBuffer& entry) {\n'
@@ -1000,7 +1012,7 @@ reclaimed_bytes = (download_source[delete_begin:delete_end]
                    .replace('total_used_memory -=', 'bytes +=')
                    .replace('slot_images[image_id]', 'image'))
 assert 'image_id' not in reclaimed_bytes, 'DeleteImage accounting needs adapting to an image reference'
-gc_begin = download_source.index('void TextureCache<P>::RunGarbageCollector() {')
+gc_begin = download_source.index('void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {')
 gc_end = download_source.index('\ntemplate <class P>', gc_begin)
 gc_original = download_source[gc_begin:gc_end]
 gc = gc_original
@@ -1011,7 +1023,7 @@ gc_setup = '''    const auto ReclaimedBytes = [&](const Image& image) {
 ''' + (port / 'vulkan_gc_downloads.inc').read_text()
 for old, new in [
     ('    const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,\n'
-     '                          &evict_old_costly]',
+     '                          &evict_old_costly, out_of_memory]',
      gc_setup + '\n    const auto Cleanup = [&, this]'),
     ('        if (must_download) {', '        if (must_download && !TakePrefetched(image_id, image)) {'),
     # Time the per-image drain Cleanup still takes for an image the prefetch could not batch.
@@ -1035,7 +1047,7 @@ for old, new in [
     gc = gc.replace(old, new)
 texture_costs = []
 for signature, index in (
-    ('RunGarbageCollector()', 13), ('DownloadMemory(DAddr cpu_addr, size_t size)', 14),
+    ('RunGarbageCollector(bool out_of_memory)', 13), ('DownloadMemory(DAddr cpu_addr, size_t size)', 14),
     ('PopAsyncFlushes()', 15),
 ):
     anchor = f'void TextureCache<P>::{signature} {{'
@@ -1063,7 +1075,50 @@ for signature, index in (
     texture_costs.append((anchor, anchor + scope))
 adapt('src/video_core/texture_cache/texture_cache.h',
       'vulkan-cache/video_core/texture_cache/texture_cache.h', [
-    ('namespace VideoCommon {', '#include "performance.h"\n#include "staging_chunks.h"\n#include "common/scope_exit.h"\nnamespace Vulkan { class TextureCacheRuntime; }\n\nnamespace VideoCommon {'),
+    ('namespace VideoCommon {', '#include "performance.h"\n#include "staging_chunks.h"\n#include "common/scope_exit.h"\nnamespace Vulkan { class TextureCacheRuntime; }\n\nnamespace VideoCommon {\n'
+     '// True while UpdateRenderTargets looks up the render targets (JoinImages: stale guest memory).\n'
+     'inline thread_local bool eden_preparing_render_targets = false;'),
+    # A render target made again at a new size, over images the GPU drew into, is not uploaded from
+    # guest memory: the GPU's drawing never reached guest memory, so what is there is stale. Ocarina
+    # of Time resizes a few render targets nearly every frame (95, 96, 97, 112x97 ... up to 1736
+    # pixels square at 0x814de35000) and each new size was uploaded, 0.5 to 5 GiB per 600 frames
+    # (2026-11-07 23:20). Only when an image it overlaps that did not fit was drawn by the GPU and none
+    # has CPU writes pending; the image is tracked so a later CPU write still uploads. For render
+    # targets and for images read at a new size alike: Ocarina draws 1504x1491 and reads 1491x1491 at
+    # the same address the next moment, and the read copy, uploaded from guest memory, holds nothing
+    # the GPU drew either (23:36: 2,052 render targets skipped, the reads still 541-651 per 600 frames).
+    # The GPU-drawn image must start at the same address and have the same format: the same target
+    # at another size. Any GPU-drawn overlap was too wide: GPU-drawn images are not tracked, so CPU
+    # writes into memory a render target had used (a texture loaded there) did not mark them, and
+    # the new texture would not be uploaded.
+    ('    } clearing_scope{clearing_render_targets};\n    clearing_render_targets = is_clear;\n',
+     '    } clearing_scope{clearing_render_targets};\n    clearing_render_targets = is_clear;\n'
+     '    eden_preparing_render_targets = true;\n'
+     '    SCOPE_EXIT { eden_preparing_render_targets = false; };\n'),
+    ('    } else {\n        // TODO: Only upload what we need\n        RefreshContents(new_image, new_image_id);\n    }\n',
+     '    } else if (!::Eden::Performance::no_stale_skip.load(std::memory_order_relaxed) &&\n'
+     '               !join_bad_overlap_ids.empty() &&\n'
+     '               std::ranges::any_of(join_bad_overlap_ids, [&](ImageId id) {\n'
+     '                   const ImageBase& overlap = slot_images[id];\n'
+     '                   return True(overlap.flags & ImageFlagBits::GpuModified) &&\n'
+     '                          overlap.gpu_addr == new_image.gpu_addr && overlap.info.format == new_info.format;\n'
+     '               }) &&\n'
+     '               std::ranges::none_of(join_bad_overlap_ids, [&](ImageId id) {\n'
+     '                   return True(slot_images[id].flags & ImageFlagBits::CpuModified);\n'
+     '               })) {\n'
+     '        static u64 eden_stale_skips = 0;\n'
+     '        if (eden_stale_skips++ % 1024 < 4) {\n'
+     '            LOG_INFO(HW_GPU, "EDEN_TC_STALE {} {:#x} {}x{} format {}: not uploaded over {} images, one GPU-drawn ({} so far)",\n'
+     '                     eden_preparing_render_targets ? "render target" : "read", new_image.gpu_addr,\n'
+     '                     new_info.size.width, new_info.size.height, static_cast<u32>(new_info.format),\n'
+     '                     join_bad_overlap_ids.size(), eden_stale_skips);\n'
+     '        }\n'
+     '        new_image.flags &= ~ImageFlagBits::CpuModified;\n'
+     '        if (False(new_image.flags & ImageFlagBits::Tracked)) {\n'
+     '            TrackImage(new_image, new_image_id);\n'
+     '        }\n'
+     '        runtime.TransitionImageLayout(new_image);\n'
+     '    } else {\n        // TODO: Only upload what we need\n        RefreshContents(new_image, new_image_id);\n    }\n'),
     (download_prefix, download_prefix + (port / 'vulkan_download_batch.inc').read_text() + '\n'),
     # Uploads UploadInChunks leaves whole (images converted on the CPU, 3D, sparse and unbacked
     # ones) are laid out in the heap and staged in pieces of at most 64 MiB once over 64 MiB
@@ -1347,10 +1402,10 @@ shader_costs = [
      '        }\n'
      '    }\n'
      '    return BuiltPipeline(current_pipeline);\n}'),
-    ('    if (is_new) {\n        entry = CreateComputePipeline(key, shader);\n    }\n'
-     '    return entry.Get(kepler_compute->IsNativeMode(),\n'
+    # (Lichii #551 rebuilds a translation whose pointer slots were null between these: the
+    # anchor is the return alone.)
+    ('    return entry.Get(kepler_compute->IsNativeMode(),\n'
      '                     kepler_compute->regs.code_loc.Address() + qmd.program_start, key);\n}',
-     '    if (is_new) {\n        entry = CreateComputePipeline(key, shader);\n    }\n'
      '    ComputePipeline* const pipeline = entry.Get(kepler_compute->IsNativeMode(),\n'
      '        kepler_compute->regs.code_loc.Address() + qmd.program_start, key);\n'
      '    if (::Eden::DevVulkan::trace_pipelines && pipeline) {\n'
@@ -1368,8 +1423,8 @@ shader_costs = [
      '    return pipeline;\n}'),
     ('std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {',
      'std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {\n    auto timer = Eden::Performance::VulkanTimer(17);'),
-    ('    const ComputePipelineCacheKey& key, const ShaderInfo* shader) {',
-     '    const ComputePipelineCacheKey& key, const ShaderInfo* shader) {\n    auto timer = Eden::Performance::VulkanTimer(17);'),
+    ('                                                               std::span<const u64> keep_pointers) {',
+     '                                                               std::span<const u64> keep_pointers) {\n    auto timer = Eden::Performance::VulkanTimer(17);'),
     ('                                                 u32 cache_version) try {',
      '                                                 u32 cache_version) try {\n    auto timer = Eden::Performance::VulkanTimer(18);'),
     ('        device.SupportsTransformFeedbackProvokingVertexPreservation();\n}\n',
@@ -1505,7 +1560,7 @@ probes = {
     ],
 }
 for name, index, expected in (
-    ('vk_fence_manager', 6, 1), ('vk_buffer_cache', 7, 5),
+    ('vk_fence_manager', 6, 1), ('vk_buffer_cache', 7, 4),
     ('vk_texture_cache', 8, 2), ('vk_swapchain', 9, 6),
     ('vk_descriptor_buffer', 10, 2), ('vk_multi_range_buffer', 11, 1),
     ('vk_compute_pass', 12, 1),
@@ -1539,38 +1594,6 @@ for name, index, expected in (
 adapt('src/video_core/renderer_vulkan/present/lsfg_shaders.cpp', 'vulkan_lsfg_shaders.cpp', [
     ('#include "video_core/vulkan_common/vulkan_device.h"',
      '#include <string>\n#include "common/settings.h"\n#include "video_core/vulkan_common/vulkan_device.h"\n#include "diagnostics.h"'),
-    ("""    if (!device.IsVulkanMemoryModelSupported() || !device.HasNullDescriptor() ||
-        !device.IsFloat16Supported()) {
-        return;
-    }""",
-     """    const bool wanted = Settings::values.frame_gen.GetValue();
-    if (!device.IsVulkanMemoryModelSupported() || !device.HasNullDescriptor() ||
-        !device.IsFloat16Supported()) {
-        if (wanted)
-            Eden::Report("framegen",
-                         ("device features: vulkanMemoryModel=" +
-                          std::to_string(device.IsVulkanMemoryModelSupported()) + " nullDescriptor=" +
-                          std::to_string(device.HasNullDescriptor()) + " float16=" +
-                          std::to_string(device.IsFloat16Supported()) +
-                          " -- all are required, and dev-settings.txt null_descriptor=off turns "
-                          "the second one off").c_str());
-        return;
-    }"""),
-    ("""    VideoCore::FrameGen::ShaderModules code;
-    if (VideoCore::FrameGen::LoadShaderModules(code) != VideoCore::FrameGen::LosslessStatus::Ok) {
-        return;
-    }""",
-     """    VideoCore::FrameGen::ShaderModules code;
-    const VideoCore::FrameGen::LosslessStatus status = VideoCore::FrameGen::LoadShaderModules(code);
-    if (status != VideoCore::FrameGen::LosslessStatus::Ok) {
-        if (wanted)
-            Eden::Report("framegen",
-                         ("Lossless.dll " + VideoCore::FrameGen::GetLosslessDllPath().string() +
-                          " status=" + std::to_string(static_cast<u32>(status)) +
-                          " (0 ok, 1 not installed, 2 unreadable, 3 not a PE, 4 no shaders in it, "
-                          "5 translation failed, 6 cache unusable)").c_str());
-        return;
-    }"""),
     ("""    valid = true;""",
      """    valid = true;
     if (wanted)
@@ -1586,30 +1609,7 @@ adapt('src/video_core/renderer_vulkan/present/frame_gen.h',
 adapt('src/video_core/renderer_vulkan/present/frame_gen.cpp', 'vulkan_frame_gen.cpp', [
     ('#include "video_core/vulkan_common/vulkan_device.h"',
      '#include "video_core/vulkan_common/vulkan_device.h"\n#include "diagnostics.h"'),
-    ("""    if (!shaders->IsValid() && Settings::values.frame_gen_type.GetValue() != Settings::FrameGenType::Fsr3) {
-        unavailable = true;
-        return;
-    }""",
-     """    if (!shaders->IsValid() && Settings::values.frame_gen_type.GetValue() != Settings::FrameGenType::Fsr3) {
-        Eden::Report("framegen", "LsfgShaders is not valid; see the lines above");
-        unavailable = true;
-        return;
-    }"""),
-    ("""    if (!frame->storage_view) {
-        warm_streak = 0;
-        return;
-    }""",
-     """    if (!frame->storage_view) {
-        if (!storage_reported) {
-            storage_reported = true;
-            Eden::Report("framegen",
-                         "the frame image has no storage view: the swapchain format lacks "
-                         "VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT, so frames cannot be generated");
-        }
-        warm_streak = 0;
-        return;
-    }"""),
-    # The gates above only say why it is not running; this says that it is.
+    # Lichii logs why frames are not generated (LsfgShaders, FrameGenState); this says that they are.
     ("""    generated = warm && warm_streak >= LSFG_RECURRENCE_FRAMES && plan.generations > 0;""",
      """    generated = warm && warm_streak >= LSFG_RECURRENCE_FRAMES && plan.generations > 0;
     if (generated && !generation_reported) {
